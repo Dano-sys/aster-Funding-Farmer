@@ -1,0 +1,5 @@
+.env
+funding_farmer.log
+trades.csv
+__pycache__/
+*.pyc
