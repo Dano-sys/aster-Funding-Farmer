@@ -14,7 +14,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Continuous min-live on Fly: 3 pools, small total cap, EU-friendly region in fly.toml (fra).
-# Restarts: --no-clean-slate avoids flattening all Aster perps on every boot.
-# Switch back to main entrypoint only: CMD ["python3", "funding_farmer.py"]
-CMD ["python3", "run_small_staged.py", "--live-small", "--live-small-budget", "120", "--live-small-pools", "3", "--no-clean-slate"]
+# Main bot on Fly: funding_farmer.py (set DRY_RUN=true via fly secrets for paper / no orders).
+# For minimal live staging instead, use: run_small_staged.py --live-small ... --no-clean-slate
+CMD ["python3", "funding_farmer.py"]
