@@ -33,6 +33,7 @@ from aster_client import (  # noqa: E402
     credentials_ok,
     get,
 )
+import exchange as ex  # noqa: E402
 
 ASTER_COLLATERAL_RATIO = 0.80
 USDF_COLLATERAL_RATIO = 0.9999
@@ -177,19 +178,30 @@ def _print_spot_section(balances: List[dict], material_thr: float, max_dust: int
 
 
 def _effective_margin_usd(rows: List[dict]) -> float:
+    aster_px = 0.0
+    try:
+        aster_px = float(get("/fapi/v1/premiumIndex", {"symbol": "ASTERUSDT"})["markPrice"])
+    except Exception:
+        pass
     total = 0.0
     for b in rows:
         asset = b.get("asset", "")
         try:
-            bal = float(b.get("balance", 0) or 0)
+            avail = float(b.get("availableBalance", 0) or 0)
+            wallet = float(b.get("balance", 0) or 0)
         except (TypeError, ValueError):
             continue
+        qty = avail if avail > 1e-12 else wallet
+        if qty <= 0:
+            continue
         if asset == "ASTER":
-            total += bal * ASTER_COLLATERAL_RATIO
+            if aster_px <= 0:
+                continue
+            total += qty * aster_px * ASTER_COLLATERAL_RATIO
         elif asset == "USDF":
-            total += bal * USDF_COLLATERAL_RATIO
+            total += qty * USDF_COLLATERAL_RATIO
         elif asset == "USDT":
-            total += bal
+            total += qty
     return total
 
 
@@ -259,7 +271,7 @@ def main() -> int:
 
     # --- perp balances ---
     try:
-        rows = get("/fapi/v2/balance", signed=True)
+        rows = ex.signed_get("/fapi/v2/balance", {})
     except Exception as e:
         print(f"FAIL  signed  GET /fapi/v3/balance  {e}")
         print("  Check keys, agent registration (Pro API), and futures permission.")
@@ -273,8 +285,8 @@ def main() -> int:
     _print_perp_section(rows, args.material, args.max_dust)
     print()
     print(
-        "Approx effective futures margin (bot formula: USDT + USDF×99.99% + ASTER×80% "
-        f"on wallet balance):  ${eff:,.2f}"
+        "Approx effective futures margin (bot formula: USDT_avail + USDF×99.99% + "
+        f"ASTER×mark×80%):  ${eff:,.2f}"
     )
 
     if args.no_spot:

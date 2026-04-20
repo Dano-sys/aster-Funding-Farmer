@@ -47,23 +47,36 @@ def _guard_assist() -> bool:
 
 # (env key, default if missing, one-line effect)
 LEVERS: List[Tuple[str, str, str]] = [
-    ("DRY_RUN", "false", "Simulated orders only; uses live prices/rates for tests"),
-    ("DRY_RUN_SIMULATED_MARGIN_USD", "(auto)", "Dry-run sizing margin; 0 = use live API total"),
+    ("DRY_RUN", "false", "Paper fills only; same paths & sizing as live (live marks/rates)"),
+    ("DRY_RUN_SIMULATED_MARGIN_USD", "0", "Fake collateral USD for sizing when >0; 0 = live API margin"),
+    ("DRY_RUN_SHOW_LIVE_WALLET_DETAILS", "true", "Dry run: log live futures/spot balances (default true)"),
     ("LEVERAGE", "3", "Higher = more PnL per move + faster liquidation risk"),
-    ("WALLET_DEPLOY_PCT", "0.80", "Share of margin deployed as notional"),
+    ("WALLET_DEPLOY_PCT", "0.80", "Deploy fraction × collateral; budget × LEVERAGE = max notional"),
     ("WALLET_MAX_USD", "0", "Hard cap on deploy budget (0 = none)"),
     ("WALLET_MIN_USD", "20", "Minimum per new position (exchange + slippage)"),
+    ("BALANCE_DUST_USD", "5", "Hide spot/futures balance lines below this USD estimate"),
     ("MAX_POSITIONS", "7", "More names = diversification; splits budget per leg"),
+    ("RESERVE_SLOT_FOR_NEW_POOLS", "false", "true = reserve 1/MAX_POSITIONS deploy for new pools"),
+    ("RESERVE_DEPLOY_PCT", "", "Optional fraction 0–0.95 reserve; overrides slot mode if set"),
     ("RANK_TOP_PCT", "0.25", "Top funding symbol’s share of deploy budget"),
     ("MAX_SINGLE_PCT", "0.30", "Max % of budget in one symbol"),
     ("MIN_FUNDING_RATE", "0.0005", "Floor to open (higher = pickier, safer carry)"),
-    ("EXIT_FUNDING_RATE", "0.0001", "Close long if funding falls below this /8h"),
+    ("EXIT_FUNDING_RATE", "0.0001", "Close long if funding falls below this (same units as API lastFundingRate)"),
     ("STOP_LOSS_PCT", "0.05", "Close if mark vs entry adverse by this fraction"),
+    ("TAKE_PROFIT_PCT", "0", "Close if mark vs entry up by this fraction (0=off)"),
+    ("FUNDING_EXIT_USE_WS_ESTIMATED", "false", "Use markPrice WS field r for funding_dropped when set"),
+    ("FUNDING_SIGN_SELF_CHECK_CYCLES", "36", "Live: compare FUNDING_FEE income vs rate every N loops (0=off)"),
     ("POLL_INTERVAL_SEC", "60", "Scan interval when flat (new opportunities)"),
     ("RISK_POLL_INTERVAL_SEC", "15", "Scan interval while a long is open (risk)"),
     ("MARK_PRICE_WS", "true", "Faster mark-based stop vs REST-only"),
     ("DELTA_NEUTRAL", "false", "HL short hedge: less delta, different HL fees/slippage"),
     ("BLACKLIST", "", "Never trade these symbols"),
+    ("MIN_QUOTE_VOLUME_24H", "0", "Min 24h USDT volume on a perp; 0 = off; cuts illiquid names"),
+    ("SYMBOL_ALLOWLIST", "", "If set, only these symbols (comma-sep) can be opened"),
+    ("FARMING_HALT", "false", "Skip new opens only; stop-loss / take-profit / funding exits still run"),
+    ("FARMING_HALT_FILE", "", "If this path exists, same as halt (touch file to stop new opens)"),
+    ("CYCLE_SNAPSHOT_ENABLE", "false", "Append one JSON line per farmer cycle for alerts/Claude"),
+    ("CYCLE_SNAPSHOT_FILE", "farmer_cycle.jsonl", "Path for cycle snapshot JSONL ring buffer"),
 ]
 
 
@@ -83,7 +96,7 @@ def cmd_levers() -> int:
         if len(shown) > 36:
             shown = shown[:35] + "…"
         print(f"{key:<30} {shown:<38} {note}")
-    print("\nEdit .env, restart funding_farmer.py. Validate on testnet / DRY_RUN first.")
+    print("\nEdit .env, restart funding_farmer.py. Validate in DRY_RUN first.")
     return 0
 
 
@@ -102,11 +115,11 @@ Profit (funding carry) tradeoffs:
   • More MAX_POSITIONS / lower RANK_TOP_PCT → diversified funding exposure, smaller per-symbol size.
   • Higher LEVERAGE → same notional uses less margin but liquidation closer — use with tight STOP_LOSS_PCT & RISK_POLL_INTERVAL_SEC.
   • Lower STOP_LOSS_PCT → exit faster on dips, more churn (fees) and missed recovery.
-  • MARK_PRICE_WS + low RISK_POLL_INTERVAL_SEC → faster reaction to marks vs 8h funding events.
+  • MARK_PRICE_WS + low RISK_POLL_INTERVAL_SEC → faster reaction to marks vs periodic funding settlements.
 
 Suggested workflow:
   1) DRY_RUN=true, tune levers, use:  python profit_assistant.py watch
-  2) Review trades.csv columns (funding_apr_pct, close_reason, pnl_pct).
+  2) Review trades.csv columns (funding_apr_pct, close_reason, pnl_usdt net of fees, pnl_gross_usdt, fees_usdt).
   3) Go live with small WALLET_MAX_USD, then widen.
 """
     )
@@ -123,11 +136,18 @@ def _fmt_row(row: Dict[str, Any]) -> str:
     if action == "CLOSE":
         pnl = row.get("pnl_usdt", "")
         pctp = row.get("pnl_pct", "")
-        base += f"  pnl={pnl} ({pctp}%)  reason={reason}"
+        fees = (row.get("fees_usdt") or "").strip()
+        fee_part = f"  fees={fees}" if fees else ""
+        base += f"  pnl_net={pnl} ({pctp}%){fee_part}  reason={reason}"
     else:
         apr = row.get("funding_apr_pct", "")
         n = row.get("notional_usdt", "")
-        base += f"  notional≈${n}  APR~{apr}%  fund/8h={row.get('funding_rate_8h','')}"
+        fee_e = (row.get("fee_entry_usdt") or "").strip()
+        fee_part = f"  fee≈{fee_e}" if fee_e else ""
+        base += (
+            f"  notional≈${n}  APR~{apr}%  fund/8h={row.get('funding_rate_8h','')}"
+            f"{fee_part}"
+        )
     return base
 
 

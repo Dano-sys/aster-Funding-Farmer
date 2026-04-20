@@ -15,7 +15,6 @@ from decimal import Decimal, ROUND_DOWN
 from typing import Any, Optional
 
 import eth_account
-import requests
 from dotenv import load_dotenv
 from eth_account.signers.local import LocalAccount
 from hyperliquid.exchange import Exchange
@@ -28,7 +27,6 @@ log = logging.getLogger(__name__)
 
 HL_PRIVATE_KEY = os.getenv("HL_PRIVATE_KEY", "").strip()
 HL_WALLET_ADDRESS = os.getenv("HL_WALLET_ADDRESS", "").strip()
-HL_TESTNET = os.getenv("HL_TESTNET", "true").lower() == "true"
 LEVERAGE_HL = int(os.getenv("LEVERAGE_HL", "3"))
 HEDGE_RATIO = float(os.getenv("HEDGE_RATIO", "1.0"))
 MIN_NET_FUNDING = float(os.getenv("MIN_NET_FUNDING", "0.0002"))
@@ -36,23 +34,6 @@ DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 
 # Simulated HL short size (coin units) when DRY_RUN=true
 _dry_hl_short: dict[str, float] = {}
-
-
-def _base_url() -> str:
-    return constants.TESTNET_API_URL if HL_TESTNET else constants.MAINNET_API_URL
-
-
-def _filtered_spot_meta(base_url: str) -> dict:
-    """
-    Testnet spotMeta can reference token indices beyond len(tokens), which breaks
-    hyperliquid Info(). Filter invalid universe rows (SDK workaround).
-    """
-    r = requests.post(f"{base_url}/info", json={"type": "spotMeta"}, timeout=15)
-    r.raise_for_status()
-    spot = r.json()
-    n = len(spot["tokens"])
-    spot["universe"] = [u for u in spot["universe"] if max(u["tokens"]) < n]
-    return spot
 
 
 def _wallet() -> LocalAccount:
@@ -70,22 +51,13 @@ def _account_address(wallet: LocalAccount) -> str:
 
 def hl_setup() -> tuple[Info, Exchange, str]:
     """
-    Initialise Hyperliquid Info + Exchange for the configured network.
+    Initialise Hyperliquid Info + Exchange on mainnet.
     Returns (info, exchange, address) as expected by funding_farmer.run().
     """
     wallet = _wallet()
     address = _account_address(wallet)
-    base_url = _base_url()
-
-    if "testnet" in base_url:
-        spot = _filtered_spot_meta(base_url)
-        meta = Info(base_url, skip_ws=True, spot_meta=spot).meta()
-        exchange = Exchange(
-            wallet, base_url, account_address=address, meta=meta, spot_meta=spot
-        )
-    else:
-        exchange = Exchange(wallet, base_url, account_address=address)
-
+    base_url = constants.MAINNET_API_URL
+    exchange = Exchange(wallet, base_url, account_address=address)
     return exchange.info, exchange, address
 
 
@@ -111,7 +83,7 @@ def _round_sz(sz: float, decimals: int) -> float:
 
 
 def hl_get_funding_rate(hl_info: Info, coin: str) -> float:
-    """Latest perp funding rate (same units as Aster: per 8h) for coin, or 0.0."""
+    """Latest perp funding rate (same units as Aster: per funding interval, often ~8h)."""
     try:
         meta, ctxs = hl_info.meta_and_asset_ctxs()
         for i, u in enumerate(meta["universe"]):

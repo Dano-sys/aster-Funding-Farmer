@@ -26,6 +26,7 @@ from aster_client import (  # noqa: E402
     credentials_ok,
     get,
 )
+import exchange as ex  # noqa: E402
 
 
 def _perp_row_mag(b: dict) -> Tuple[float, float, float, float]:
@@ -138,7 +139,7 @@ def main() -> int:
         return 1
 
     try:
-        perp_rows = get("/fapi/v2/balance", signed=True)
+        perp_rows = ex.signed_get("/fapi/v2/balance", {})
     except Exception as e:
         print(f"Perpetual balance failed: {e}")
         return 1

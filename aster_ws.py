@@ -3,6 +3,11 @@ Futures mark-price WebSocket (Aster / Binance-compatible streams).
 
 Subscribes to <symbol>@markPrice on wss://fstream.asterdex.com/stream — pushes faster than
 REST polling for stop-loss vs entry price. Does not replace exchange liquidation.
+
+Payloads may include a Binance-style ``r`` field (estimated funding for the current interval).
+Aster REST ``GET /fapi/v1/premiumIndex`` exposes ``lastFundingRate`` only; when ``r`` is
+present on the stream, ``MarkPriceWatcher.get_estimated_funding`` exposes it for optional
+exit logic (see ``FUNDING_EXIT_USE_WS_ESTIMATED`` in funding_farmer).
 """
 
 from __future__ import annotations
@@ -55,6 +60,8 @@ class MarkPriceWatcher:
         self._ws_ref_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._running = False
+        self._est_funding: Dict[str, float] = {}
+        self._est_funding_lock = threading.Lock()
 
     @staticmethod
     def _streams_query(symbols: Set[str]) -> str:
@@ -83,6 +90,16 @@ class MarkPriceWatcher:
                     w.close()
                 except Exception:
                     pass
+        with self._est_funding_lock:
+            for k in list(self._est_funding.keys()):
+                if k not in symbols:
+                    self._est_funding.pop(k, None)
+
+    def get_estimated_funding(self, symbol: str) -> Optional[float]:
+        """Latest ``r`` from markPrice stream for ``symbol``, if any."""
+        with self._est_funding_lock:
+            v = self._est_funding.get(symbol)
+        return v if v is not None else None
 
     def drain_stop_signals(self) -> list[str]:
         out: list[str] = []
@@ -134,6 +151,14 @@ class MarkPriceWatcher:
                 entry,
                 pnl_pct * 100,
             )
+        r_raw = data.get("r")
+        if sym and r_raw is not None:
+            try:
+                rf = float(r_raw)
+                with self._est_funding_lock:
+                    self._est_funding[sym] = rf
+            except (TypeError, ValueError):
+                pass
 
     def _run(self) -> None:
         while self._running:

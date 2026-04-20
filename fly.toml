@@ -1,0 +1,17 @@
+# Private worker: no [http_service] — not reachable from the public internet.
+# Set `app` to your Fly app name, then: fly secrets import < .env  (or fly secrets set KEY=...)
+# Logs: fly logs
+
+app = "aster-funding-farmer"
+# Egress IP / geo: was iad (US). If Aster returns -5019 on orders, try EU (fra) or Asia (sin, nrt).
+primary_region = "fra"
+
+[build]
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
+
+[[restart]]
+  policy = "always"

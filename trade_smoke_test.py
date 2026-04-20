@@ -43,6 +43,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from aster_client import FAPI_BASE, SAPI_BASE, credentials_ok, get, post  # noqa: E402
+import exchange as ex  # noqa: E402
+
+# Repo-wide safety semantics: DRY_RUN means “no live orders”, across all entrypoints.
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 
 # Match funding_farmer.py — ASTER as futures collateral (multi-asset mode)
 ASTER_COLLATERAL_RATIO = float(os.getenv("ASTER_COLLATERAL_RATIO", "0.80"))
@@ -136,7 +140,7 @@ def spot_usdt_free() -> float:
 
 
 def perp_usdt_available() -> float:
-    rows = get("/fapi/v2/balance", signed=True)
+    rows = ex.signed_get("/fapi/v2/balance", {})
     for b in rows:
         if b.get("asset") == "USDT":
             return float(b.get("availableBalance", 0) or 0)
@@ -144,7 +148,7 @@ def perp_usdt_available() -> float:
 
 
 def perp_asset_wallet(asset: str) -> float:
-    rows = get("/fapi/v2/balance", signed=True)
+    rows = ex.signed_get("/fapi/v2/balance", {})
     for b in rows:
         if b.get("asset") == asset:
             return float(b.get("balance", 0) or 0)
@@ -155,7 +159,7 @@ def perp_effective_margin_usdt() -> Tuple[float, str]:
     """
     Rough USDT-equivalent collateral: USDT available + discounted ASTER/USDF wallet (like funding_farmer).
     """
-    rows = get("/fapi/v2/balance", signed=True)
+    rows = ex.signed_get("/fapi/v2/balance", {})
     aster_px = float(get("/fapi/v1/premiumIndex", {"symbol": "ASTERUSDT"})["markPrice"])
     usdt = 0.0
     aster_bal = 0.0
@@ -188,13 +192,13 @@ def perp_initial_margin_estimate(notional_usdt: float, leverage: int) -> float:
 def ensure_multi_asset_margin() -> None:
     """So ASTER/USDF futures wallet counts as margin (idempotent)."""
     try:
-        r = get("/fapi/v1/multiAssetsMargin", signed=True)
+        r = ex.signed_get("/fapi/v1/multiAssetsMargin", {})
         if r.get("multiAssetsMargin") is True:
             return
     except Exception:
         pass
     try:
-        post("/fapi/v1/multiAssetsMargin", {"multiAssetsMargin": "true"})
+        ex.signed_post("/fapi/v1/multiAssetsMargin", {"multiAssetsMargin": "true"})
     except RuntimeError as e:
         if "No need" not in str(e):
             raise
@@ -219,7 +223,7 @@ def spot_last_price(symbol: str) -> float:
 
 
 def perp_position_amt(symbol: str) -> float:
-    rows = get("/fapi/v2/positionRisk", signed=True)
+    rows = ex.signed_get("/fapi/v2/positionRisk", {"symbol": symbol})
     for p in rows:
         if p.get("symbol") == symbol:
             return float(p.get("positionAmt", 0) or 0)
@@ -242,7 +246,7 @@ def print_balances() -> None:
 
     print()
     print(f"Perp  {FAPI_BASE}/fapi/v3/balance")
-    rows = get("/fapi/v2/balance", signed=True)
+    rows = ex.signed_get("/fapi/v2/balance", {})
     hdr2 = f"  {'Asset':<10} {'Available':>18}"
     print(hdr2)
     for b in sorted(rows, key=lambda x: x.get("asset", "")):
@@ -301,12 +305,12 @@ def _benign_leverage_change(exc: BaseException) -> bool:
 
 def _set_cross_and_leverage(symbol: str, leverage: int) -> None:
     try:
-        post("/fapi/v1/marginType", {"symbol": symbol, "marginType": "CROSSED"})
+        ex.signed_post("/fapi/v1/marginType", {"symbol": symbol, "marginType": "CROSSED"})
     except Exception as e:
         if not _benign_margin_type_change(e):
             raise
     try:
-        post("/fapi/v1/leverage", {"symbol": symbol, "leverage": str(leverage)})
+        ex.signed_post("/fapi/v1/leverage", {"symbol": symbol, "leverage": str(leverage)})
     except Exception as e:
         if not _benign_leverage_change(e):
             raise
@@ -522,15 +526,7 @@ def run_execute(
     _set_cross_and_leverage(symbol, lev)
     mark = perp_mark_price(symbol)
     qty_buy = perp_qty_for_min_notional(perp_min, mark, step_perp)
-    o2 = post(
-        "/fapi/v1/order",
-        {
-            "symbol": symbol,
-            "side": "BUY",
-            "type": "MARKET",
-            "quantity": qty_buy,
-        },
-    )
+    o2 = ex.place_market_order_raw(symbol=symbol, side="BUY", quantity=qty_buy)
     print(f"  orderId={o2.get('orderId')} status={o2.get('status')} qty={qty_buy}")
 
     print()
@@ -589,15 +585,11 @@ def run_execute(
         print(f"  WARN: no long position on {symbol} (amt={amt})", file=sys.stderr)
     else:
         qty_close = round_step(amt, step_perp)
-        o4 = post(
-            "/fapi/v1/order",
-            {
-                "symbol": symbol,
-                "side": "SELL",
-                "type": "MARKET",
-                "quantity": qty_close,
-                "reduceOnly": "true",
-            },
+        o4 = ex.place_market_order_raw(
+            symbol=symbol,
+            side="SELL",
+            quantity=qty_close,
+            reduce_only=True,
         )
         print(f"  orderId={o4.get('orderId')} status={o4.get('status')} qty={qty_close}")
 
@@ -678,6 +670,15 @@ def main() -> int:
             "Tip: with little spot USDT, omit flags — auto picks ASTER-first when possible."
         )
         return 0
+
+    if DRY_RUN:
+        run_plan(args.symbol, spot_sym, perp_sym, aster_first, mode_reason)
+        print()
+        print(
+            "DRY_RUN=true — refusing to place live orders. "
+            "Set DRY_RUN=false to use --execute."
+        )
+        return 1
 
     return run_execute(args.symbol, spot_sym, perp_sym, args.wait, aster_first)
 
