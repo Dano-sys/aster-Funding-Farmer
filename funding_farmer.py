@@ -62,12 +62,34 @@ init(autoreset=True)
 
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
+_LOG_MESSAGE_FORMAT = "%(asctime)s %(levelname)s [%(shortname)s] %(message)s"
 
-class _StripAnsiFormatter(logging.Formatter):
+
+class _ShortLoggerFormatter(logging.Formatter):
+    """ISO-8601 UTC timestamps and last segment of logger name for scanability."""
+
+    def formatTime(self, record: logging.LogRecord, datefmt: Optional[str] = None) -> str:
+        dt = datetime.fromtimestamp(record.created, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+
+    def format(self, record: logging.LogRecord) -> str:
+        record.shortname = record.name.rsplit(".", 1)[-1]
+        return super().format(record)
+
+
+class _StripAnsiFormatter(_ShortLoggerFormatter):
     """File logs without embedded colorama / ANSI codes (easier to parse and tail)."""
 
     def format(self, record: logging.LogRecord) -> str:
         return _ANSI_ESCAPE.sub("", super().format(record))
+
+
+def _parse_log_level(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip().upper()
+    if not raw:
+        return default
+    level = getattr(logging, raw, None)
+    return level if isinstance(level, int) else default
 
 
 def _configure_logging() -> None:
@@ -75,13 +97,15 @@ def _configure_logging() -> None:
     if getattr(root, "_funding_farmer_logging", False):
         return
     root.setLevel(logging.INFO)
-    _fmt = "%(asctime)s %(levelname)s %(message)s"
-    fh = logging.FileHandler("funding_farmer.log", encoding="utf-8")
-    fh.setFormatter(_StripAnsiFormatter(_fmt))
+    log_path = os.getenv("FUNDING_FARMER_LOG", "funding_farmer.log").strip() or "funding_farmer.log"
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setFormatter(_StripAnsiFormatter(_LOG_MESSAGE_FORMAT))
     sh = logging.StreamHandler()
-    sh.setFormatter(logging.Formatter(_fmt))
+    sh.setFormatter(_ShortLoggerFormatter(_LOG_MESSAGE_FORMAT))
     root.addHandler(fh)
     root.addHandler(sh)
+    ex_level = _parse_log_level("LOG_EXCHANGE_LEVEL", logging.INFO)
+    logging.getLogger("exchange").setLevel(ex_level)
     root._funding_farmer_logging = True  # type: ignore[attr-defined]
 
 
@@ -166,12 +190,14 @@ WALLET_MAX_USD    = float(os.getenv("WALLET_MAX_USD", "0"))
 WALLET_MIN_USD    = float(os.getenv("WALLET_MIN_USD", "20"))
 
 # Dry run mode
-# true  = live API reads (rates, marks, funding) + same sizing/path as live, but orders are
-#         simulated in memory (paper fills). Set DRY_RUN_SIMULATED_MARGIN_USD for fake wallet size.
-# false = live trading (default)
+# true  = live API reads (rates, marks, balances) + same sizing math as live, but perp orders are
+#         simulated in memory only (no POST /order). Wallet: when DRY_RUN_SIMULATED_MARGIN_USD is 0
+#         (default), deploy budget uses your real effective margin from GET /fapi/v2/balance (+ cap
+#         logic). When DRY_RUN_SIMULATED_MARGIN_USD > 0, sizing uses that USD instead of wallet.
+# false = live trading
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
-# Dry run: override effective margin for sizing when > 0. If unset/empty, use 0 (live API margin).
-# Set e.g. 2000 for fixed paper collateral without changing real balances.
+# Dry run: if > 0, replace effective margin for sizing (fixed paper wallet). If 0 / unset, sizing
+# uses live API margin like production — still no real orders while DRY_RUN=true.
 _drs = os.getenv("DRY_RUN_SIMULATED_MARGIN_USD")
 if _drs is None or str(_drs).strip() == "":
     DRY_RUN_SIMULATED_MARGIN_USD = 0.0
@@ -2041,7 +2067,12 @@ def print_startup_banner(collateral: dict, aster_price: float):
         if DRY_RUN_SIMULATED_MARGIN_USD > 0:
             log_warn(
                 f"  Position sizing uses simulated margin ${DRY_RUN_SIMULATED_MARGIN_USD:.0f} "
-                f"(DRY_RUN_SIMULATED_MARGIN_USD). Set to 0 to size from live API margin instead."
+                f"(DRY_RUN_SIMULATED_MARGIN_USD). Set to 0 to size from live API wallet margin instead."
+            )
+        else:
+            log_success(
+                "  Dry run sizing: live wallet effective margin (DRY_RUN_SIMULATED_MARGIN_USD=0); "
+                "perp orders simulated only."
             )
         log_success("=" * 62)
     log_success("  Aster Funding Rate Farmer  --  Multi-Asset Margin Mode")
@@ -2232,7 +2263,12 @@ def run(max_cycles: int = 0) -> None:
     while True:
         try:
             main_loop_i += 1
-            log_info("\n Scanning funding rates...")
+            _cycle_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            log_info_styled(
+                f"\n{Style.DIM}{Fore.LIGHTBLACK_EX}  === cycle {main_loop_i} · {_cycle_ts} ==="
+                f"{Style.RESET_ALL}"
+            )
+            log_info("  Scanning funding rates...")
             rates = get_all_funding_rates()
             maybe_log_funding_sign_selfcheck(main_loop_i, open_symbols, rates)
 

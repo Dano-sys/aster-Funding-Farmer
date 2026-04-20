@@ -94,9 +94,11 @@ run()
 
 `DRY_RUN=true` in `.env` — the default in `.env.example`. Set to `false` when ready to go live.
 
+**Sizing vs simulation:** With **`DRY_RUN_SIMULATED_MARGIN_USD=0`** (default in `.env.example`), the deploy budget uses your **real** effective futures margin from the API — same formula as live — while **orders stay simulated**. With **`DRY_RUN_SIMULATED_MARGIN_USD > 0`**, sizing uses that fixed USD instead of your wallet (useful for fixed “what if $2k” runs or quieter dependency on balance).
+
 **What runs live in dry run:**
 - Rate scanning (`GET /fapi/v1/premiumIndex`) — real Aster data
-- Wallet/balance fetch (`GET /fapi/v3/balance`) — real balances
+- Wallet/balance fetch (`GET /fapi/v2/balance`, signed) — real balances for display and (when simulated margin is 0) for sizing
 - Price fetches (`GET /fapi/v1/premiumIndex` per symbol) — real prices
 
 **What is simulated:**
