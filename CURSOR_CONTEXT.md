@@ -128,6 +128,20 @@ Official mechanics and formulas: [Funding Rate — Aster perpetuals](https://doc
 - **Sign vs wallet:** Aster’s prose defines who pays whom for a **positive** published rate; the bot periodically **compares** recent `FUNDING_FEE` rows from `GET /fapi/v1/income` with `lastFundingRate` for open symbols (see `FUNDING_SIGN_SELF_CHECK_CYCLES`). Validate thresholds against your own realized income.
 - **CSV / dashboard:** Column `funding_rate_8h` is a legacy name; stored values are **percent per API funding interval**. APR columns use the learned (or default 8h) fundings-per-day multiplier.
 
+## KPIs, profit vs points, tuning
+
+The farmer **ranks by** REST `lastFundingRate` and does **not** optimize Aster leaderboard points in code. Use explicit KPIs when tuning `.env`:
+
+| Priority | What to measure | Where |
+|----------|-----------------|--------|
+| **Dollar profit (default)** | Sum of **`pnl_net_incl_funding_usdt`** on CLOSE rows (mark PnL − fees + realized `FUNDING_FEE` over the hold window) | `trades.csv`, `python profit_assistant.py summary` |
+| Price-only PnL | **`pnl_usdt`** — net of **trading fees** only; **excludes** funding until you use the inclusive column | same CSV |
+| Points (qualitative) | Trading proxy: **`fees_usdt`**; position proxy: **`notional_usdt`** × **`hold_duration_min`**; asset points: **USDF + ASTER** futures margin + multi-asset (startup log `[Stage6 margin]`) | Official Stage 6 docs; `python profit_assistant.py kpi` |
+
+**Tuning loop:** `DRY_RUN=true` → adjust `MIN_FUNDING_RATE`, `EXIT_FUNDING_RATE`, `STOP_LOSS_PCT`, `MAX_POSITIONS`, `RANK_TOP_PCT`, `LEVERAGE` → run the farmer → `python profit_assistant.py summary` and `watch` on closes. Live: keep **`FUNDING_SIGN_SELF_CHECK_CYCLES`** on so realized `FUNDING_FEE` sign is checked against `lastFundingRate` for open longs.
+
+**Optional fee-aware opens:** `ESTIMATED_TAKER_FEE_BPS` + **`MAX_FEE_BREAKEVEN_FUNDING_INTERVALS`** (see [.env.example](.env.example)) — skip new longs when `|lastFundingRate|` is too small versus assumed round-trip taker fees (magnitude gate; not a substitute for sign validation).
+
 ## Staged live run (test → full)
 
 Use the same code path while limiting risk:

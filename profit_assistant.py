@@ -9,7 +9,11 @@ Does not place trades. Optional: disable advise with PROFIT_ASSISTANT_ENABLED=fa
   python profit_assistant.py watch          # tail trades.csv (TRADE_LOG_FILE)
   python profit_assistant.py levers         # show key .env knobs + what they do
   python profit_assistant.py tips           # profit vs points tradeoffs
+  python profit_assistant.py kpi            # primary KPIs (profit vs points proxies)
+  python profit_assistant.py summary        # aggregate CLOSE rows from trades.csv
   python profit_assistant.py watch --from-start   # replay whole file then follow
+
+  kpi and summary run even when PROFIT_ASSISTANT_ENABLED=false (same as watch).
 """
 
 from __future__ import annotations
@@ -39,7 +43,7 @@ def _guard_assist() -> bool:
         return True
     print(
         "PROFIT_ASSISTANT_ENABLED=false — levers/tips disabled. "
-        "Set PROFIT_ASSISTANT_ENABLED=true in .env or use: watch",
+        "Set PROFIT_ASSISTANT_ENABLED=true in .env or use: watch | kpi | summary",
         file=sys.stderr,
     )
     return False
@@ -77,6 +81,8 @@ LEVERS: List[Tuple[str, str, str]] = [
     ("FARMING_HALT_FILE", "", "If this path exists, same as halt (touch file to stop new opens)"),
     ("CYCLE_SNAPSHOT_ENABLE", "false", "Append one JSON line per farmer cycle for alerts/Claude"),
     ("CYCLE_SNAPSHOT_FILE", "farmer_cycle.jsonl", "Path for cycle snapshot JSONL ring buffer"),
+    ("ESTIMATED_TAKER_FEE_BPS", "5", "Assumed fee each side for fee-breakeven gate (see farmer)"),
+    ("MAX_FEE_BREAKEVEN_FUNDING_INTERVALS", "0", "Skip opens if RT fees need more intervals (0=off)"),
 ]
 
 
@@ -119,10 +125,119 @@ Profit (funding carry) tradeoffs:
 
 Suggested workflow:
   1) DRY_RUN=true, tune levers, use:  python profit_assistant.py watch
-  2) Review trades.csv columns (funding_apr_pct, close_reason, pnl_usdt net of fees, pnl_gross_usdt, fees_usdt).
-  3) Go live with small WALLET_MAX_USD, then widen.
+  2) After sessions:  python profit_assistant.py summary  (totals on CLOSE rows)
+  3) Review trades.csv: primary $ KPI = pnl_net_incl_funding_usdt; pnl_usdt = price PnL net fees only.
+  4) Go live with small WALLET_MAX_USD, then widen.
 """
     )
+    return 0
+
+
+def cmd_kpi() -> int:
+    """Documented primary metrics for profit vs Stage-6-style points (no on-chain scoring in-repo)."""
+    print(
+        """\
+Primary KPIs (this repo — choose what you optimize for):
+
+  1) Dollar profit (recommended for “still in profit”)
+     • Sum CLOSE rows:  pnl_net_incl_funding_usdt  (= mark PnL − fees + realized FUNDING_FEE in hold window)
+     • Do not use pnl_usdt alone for funding farms — it excludes funding accrual until close aggregates it.
+     • Command:  python profit_assistant.py summary
+
+  2) Drawdown / risk (constraint, not a CSV column)
+     • Tune STOP_LOSS_PCT, LEVERAGE, WALLET_MAX_USD, MARK_PRICE_WS + RISK_POLL_INTERVAL_SEC
+     • Track worst peak-to-trough on margin or per-close pnl_net_incl_funding_usdt in your own sheet.
+
+  3) Points (qualitative — official Stage 6 rules are on docs.asterdex.com)
+     • Trading points proxy: fees_usdt on closes (more churn → more fees → more trading points, less $ net).
+     • Position points proxy: notional_usdt × hold_duration_min on closes (bigger + longer → more).
+     • Aster Asset points: USDF + ASTER futures margin + multi-asset mode (farmer logs [Stage6 margin] at startup).
+     • The bot does not maximize points; it ranks by lastFundingRate. Align .env levers after picking (1) vs (3).
+
+Entry signal note: new opens still use REST lastFundingRate only; optional WS field ``r`` is for funding_dropped exits when enabled — not used for ranking today.
+"""
+    )
+    return 0
+
+
+def _parse_float_cell(raw: str) -> Optional[float]:
+    s = (raw or "").strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def cmd_summary(trade_path: Path) -> int:
+    """Aggregate CLOSE rows from TRADE_LOG_FILE for tuning MIN_FUNDING_RATE / exits / sizing."""
+    path = trade_path.resolve()
+    if not path.is_file():
+        print(f"No file: {path}", file=sys.stderr)
+        return 1
+    closes: List[Dict[str, str]] = []
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or ()
+        for row in reader:
+            if (row.get("action") or "").strip().upper() != "CLOSE":
+                continue
+            closes.append(row)
+
+    n = len(closes)
+    print(f"Trade log: {path}\nCLOSE rows: {n}\n")
+
+    if n == 0:
+        print("No closes yet — run DRY_RUN or live, then re-run summary.")
+        return 0
+
+    def col_sum(key: str) -> Tuple[float, int]:
+        s = 0.0
+        c = 0
+        for r in closes:
+            v = _parse_float_cell(r.get(key, "") or "")
+            if v is not None:
+                s += v
+                c += 1
+        return s, c
+
+    pnl_net, _ = col_sum("pnl_usdt")
+    fees, _ = col_sum("fees_usdt")
+    gross, _ = col_sum("pnl_gross_usdt")
+    fund, nf = col_sum("funding_income_usdt")
+    pnl_all, na = col_sum("pnl_net_incl_funding_usdt")
+
+    print(f"  Sum pnl_usdt (price, net fees, no funding in col):     ${pnl_net:+,.4f}")
+    print(f"  Sum pnl_gross_usdt (price only, before fees):          ${gross:+,.4f}")
+    print(f"  Sum fees_usdt (entry+exit commissions on closes):      ${fees:+,.4f}")
+    if nf:
+        print(f"  Sum funding_income_usdt (window on close):             ${fund:+,.4f}  ({nf} rows)")
+    else:
+        print("  Sum funding_income_usdt:                              (column missing or empty)")
+    if na:
+        print(
+            f"  Sum pnl_net_incl_funding_usdt **primary $ KPI**:      ${pnl_all:+,.4f}  ({na} rows)"
+        )
+    else:
+        print(
+            "  Sum pnl_net_incl_funding_usdt:                        (column missing — upgrade farmer / migrate CSV)"
+        )
+
+    by_reason: Dict[str, int] = {}
+    for r in closes:
+        reason = (r.get("close_reason") or "").strip() or "(empty)"
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+    print("\nClose reasons:")
+    for reason, cnt in sorted(by_reason.items(), key=lambda x: (-x[1], x[0])):
+        print(f"  {cnt:4d}  {reason}")
+
+    hold_sum, nh = col_sum("hold_duration_min")
+    if nh:
+        print(f"\nMean hold (min): {hold_sum / nh:.1f}  (over {nh} closes with hold_duration_min)")
+
+    print("\nTune loop: adjust MIN_FUNDING_RATE, EXIT_FUNDING_RATE, STOP_LOSS_PCT, MAX_POSITIONS, "
+          "RANK_TOP_PCT in .env → DRY_RUN → summary again.")
     return 0
 
 
@@ -138,7 +253,12 @@ def _fmt_row(row: Dict[str, Any]) -> str:
         pctp = row.get("pnl_pct", "")
         fees = (row.get("fees_usdt") or "").strip()
         fee_part = f"  fees={fees}" if fees else ""
-        base += f"  pnl_net={pnl} ({pctp}%){fee_part}  reason={reason}"
+        p_all = (row.get("pnl_net_incl_funding_usdt") or "").strip()
+        fund = (row.get("funding_income_usdt") or "").strip()
+        inc_part = ""
+        if p_all or fund:
+            inc_part = f"  pnl+funding={p_all}" + (f"  fund={fund}" if fund else "")
+        base += f"  pnl_net={pnl} ({pctp}%){fee_part}{inc_part}  reason={reason}"
     else:
         apr = row.get("funding_apr_pct", "")
         n = row.get("notional_usdt", "")
@@ -203,6 +323,15 @@ def main() -> int:
 
     sub.add_parser("levers", help="List main .env levers and what they affect")
     sub.add_parser("tips", help="Notes on profit vs points and risk knobs")
+    sub.add_parser("kpi", help="Primary KPIs: $ net incl. funding vs points proxies")
+
+    p_s = sub.add_parser("summary", help="Aggregate CLOSE rows (pnl, fees, funding) from CSV")
+    p_s.add_argument(
+        "--file",
+        type=Path,
+        default=None,
+        help=f"CSV path (default: env TRADE_LOG_FILE or {TRADE_LOG_FILE})",
+    )
 
     args = ap.parse_args()
 
@@ -213,6 +342,11 @@ def main() -> int:
         return cmd_levers()
     if args.cmd == "tips":
         return cmd_tips()
+    if args.cmd == "kpi":
+        return cmd_kpi()
+    if args.cmd == "summary":
+        fpath = args.file or Path(TRADE_LOG_FILE)
+        return cmd_summary(fpath)
     return 1
 
 

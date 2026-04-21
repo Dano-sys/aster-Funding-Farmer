@@ -169,6 +169,21 @@ try:
     FUNDING_SIGN_SELF_CHECK_CYCLES = max(0, int(_fssc))
 except ValueError:
     FUNDING_SIGN_SELF_CHECK_CYCLES = 36
+
+# Fee-aware new opens (optional): skip if |lastFundingRate| is too small vs assumed round-trip taker fees.
+# Breakeven funding intervals ≈ (2 * ESTIMATED_TAKER_FEE_BPS / 10000) / abs(rate). When
+# MAX_FEE_BREAKEVEN_FUNDING_INTERVALS > 0, skip opens that need more intervals than this to cover fees.
+_est_fee_bps = os.getenv("ESTIMATED_TAKER_FEE_BPS", "5").strip()
+try:
+    ESTIMATED_TAKER_FEE_BPS = max(0.0, float(_est_fee_bps))
+except ValueError:
+    ESTIMATED_TAKER_FEE_BPS = 5.0
+_mfbfi = os.getenv("MAX_FEE_BREAKEVEN_FUNDING_INTERVALS", "0").strip()
+try:
+    MAX_FEE_BREAKEVEN_FUNDING_INTERVALS = max(0.0, float(_mfbfi))
+except ValueError:
+    MAX_FEE_BREAKEVEN_FUNDING_INTERVALS = 0.0
+
 BLACKLIST         = [s for s in os.getenv("BLACKLIST", "").split(",") if s]
 TRADE_LOG_FILE    = os.getenv("TRADE_LOG_FILE", "trades.csv")
 
@@ -1510,6 +1525,58 @@ def is_correlated(symbol: str, open_symbols: set) -> bool:
     return False
 
 
+def fee_breakeven_funding_intervals(funding_rate: float) -> float:
+    """
+    Approximate number of funding settlements at |rate| needed to pay round-trip
+    taker fees once (open + close), ignoring sign of carry vs long/short economics.
+
+    Uses abs(rate) so the gate is a magnitude floor vs fees; validate real carry with
+    FUNDING_FEE income and MIN_FUNDING_RATE.
+    """
+    fr = abs(float(funding_rate))
+    if fr < 1e-18:
+        return float("inf")
+    rt_fee_frac = 2.0 * ESTIMATED_TAKER_FEE_BPS / 10000.0
+    return rt_fee_frac / fr
+
+
+def funding_passes_fee_breakeven(funding_rate: float) -> bool:
+    """True if fee breakeven gate is off, or |rate| is large enough vs ESTIMATED_TAKER_FEE_BPS."""
+    if MAX_FEE_BREAKEVEN_FUNDING_INTERVALS <= 0:
+        return True
+    return fee_breakeven_funding_intervals(funding_rate) <= MAX_FEE_BREAKEVEN_FUNDING_INTERVALS
+
+
+def log_aster_points_margin_advisory(collateral: dict) -> None:
+    """
+    Stage 6–style margin mix reminder + KPI pointer (runs once after wallet summary).
+    """
+    if not collateral:
+        return
+    aster = collateral.get("ASTER") or {}
+    usdf = collateral.get("USDF") or {}
+    a_eff = float(aster.get("effective_usdt") or 0)
+    u_eff = float(usdf.get("effective_usdt") or 0)
+    ok_a = a_eff >= 1.0
+    ok_u = u_eff >= 1.0
+    if ok_a and ok_u:
+        log_success(
+            "  [Stage6 margin] USDF + ASTER both in futures wallet — strong Aster Asset Points setup; "
+            "profit KPI: sum CLOSE `pnl_net_incl_funding_usdt` (see `python profit_assistant.py kpi`)"
+        )
+    else:
+        hints: List[str] = []
+        if not ok_u:
+            hints.append("add USDF to futures wallet for 99.99% collateral + asset points")
+        if not ok_a:
+            hints.append("add ASTER to futures wallet for 80% hair asset points")
+        log_info(
+            "  [Stage6 margin] " + "; ".join(hints).capitalize()
+            + ". Live: verify long-side funding with FUNDING_SIGN_SELF_CHECK_CYCLES vs "
+            "GET /fapi/v1/income FUNDING_FEE rows."
+        )
+
+
 def is_pool_symbol_eligible(
     r: dict,
     exchange_info: dict,
@@ -2163,6 +2230,11 @@ def print_startup_banner(collateral: dict, aster_price: float):
         f"(same units as API lastFundingRate; ~{MIN_FUNDING_RATE*3*365*100:.1f}% APR "
         f"if 8h interval)"
     )
+    if MAX_FEE_BREAKEVEN_FUNDING_INTERVALS > 0:
+        log_success(
+            f"  Fee-aware opens: skip if breakeven > {MAX_FEE_BREAKEVEN_FUNDING_INTERVALS:.0f} "
+            f"funding intervals (ESTIMATED_TAKER_FEE_BPS={ESTIMATED_TAKER_FEE_BPS:.0f})"
+        )
     if MIN_QUOTE_VOLUME_24H > 0:
         log_success(
             f"  Pool quality: 24h quote volume ≥ ${MIN_QUOTE_VOLUME_24H:,.0f} USDT "
@@ -2179,6 +2251,7 @@ def print_startup_banner(collateral: dict, aster_price: float):
     log_success(f"  SHOW_BOOK_IN_LOGS:  {SHOW_BOOK_IN_LOGS}")
     dn_status = "ENABLED (set DELTA_NEUTRAL=false to disable)" if DELTA_NEUTRAL else "disabled (set DELTA_NEUTRAL=true to enable HL hedge)"
     log_success(f"  Delta-neutral: {dn_status}")
+    log_aster_points_margin_advisory(collateral)
     log_success("=" * 62)
 
 def run(max_cycles: int = 0) -> None:
@@ -2473,6 +2546,15 @@ def run(max_cycles: int = 0) -> None:
                     if notional < WALLET_MIN_USD:
                         log_warn(f"  {sym} notional ${notional:.0f} below min "
                                  f"${WALLET_MIN_USD:.0f} -- skipping")
+                        continue
+                    if not funding_passes_fee_breakeven(rate):
+                        be = fee_breakeven_funding_intervals(rate)
+                        log_warn(
+                            f"  {sym} skip fee breakeven: ~{be:.1f} funding intervals to cover "
+                            f"est. RT fees ({ESTIMATED_TAKER_FEE_BPS:.0f} bps/side) vs |rate|="
+                            f"{abs(float(rate)):.6g} — raise MAX_FEE_BREAKEVEN_FUNDING_INTERVALS "
+                            "or lower ESTIMATED_TAKER_FEE_BPS to allow"
+                        )
                         continue
                     apr      = funding_apr_pct_for_symbol(rate, sym)
                     mins     = max(0, (c["nextFundingTime"] - int(time.time()*1000)) // 60000)

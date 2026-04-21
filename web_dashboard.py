@@ -732,6 +732,18 @@ INDEX_HTML = """<!DOCTYPE html>
         html += '<div style="font-size:0.72rem;color:var(--muted);margin-bottom:0.35rem">'
           + esc(ts) + ' · model ' + esc(entry.model || '') + '</div>';
         html += '<p style="margin:0 0 0.35rem"><strong>Summary</strong> ' + esc(inner.summary || '') + '</p>';
+        const dn = inner.debug_notes;
+        if (dn) {
+          if (Array.isArray(dn) && dn.length) {
+            html += '<p style="margin:0.35rem 0 0;font-size:0.82rem"><strong>Debug</strong></p><ul style="margin:0.2rem 0 0;padding-left:1.2rem;font-size:0.82rem">';
+            for (const line of dn) {
+              html += '<li>' + esc(String(line)) + '</li>';
+            }
+            html += '</ul>';
+          } else if (typeof dn === 'string' && dn.trim()) {
+            html += '<p style="margin:0.35rem 0 0;font-size:0.82rem"><strong>Debug</strong> ' + esc(dn) + '</p>';
+          }
+        }
         const rf = inner.risk_flags || [];
         if (rf.length) {
           html += '<p style="margin:0.35rem 0 0;font-size:0.82rem"><strong>Risk</strong> '
@@ -750,6 +762,18 @@ INDEX_HTML = """<!DOCTYPE html>
           for (const ch of envc) {
             html += '<li><code>' + esc(ch.key) + '</code> → ' + esc(ch.value) + ' — '
               + esc(ch.rationale || '') + '</li>';
+          }
+          html += '</ul></details>';
+        }
+        const scc = inner.suggested_code_changes || [];
+        if (scc.length) {
+          html += '<details style="margin-top:0.35rem"><summary style="cursor:pointer;color:var(--accent)">'
+            + 'Code hints (' + scc.length + ')</summary>';
+          html += '<ul style="margin:0.35rem 0 0;padding-left:1.2rem;font-size:0.82rem">';
+          for (const ch of scc) {
+            const fn = ch && ch.file != null ? String(ch.file) : '';
+            const hint = ch && ch.hint != null ? String(ch.hint) : '';
+            html += '<li><code>' + esc(fn) + '</code> — ' + esc(hint) + '</li>';
           }
           html += '</ul></details>';
         }
