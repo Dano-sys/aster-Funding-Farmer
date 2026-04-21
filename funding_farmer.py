@@ -35,6 +35,7 @@ import json
 import os
 import re
 import csv
+import statistics
 import time
 from typing import AbstractSet, List, Optional, Tuple
 import logging
@@ -169,6 +170,66 @@ try:
     FUNDING_SIGN_SELF_CHECK_CYCLES = max(0, int(_fssc))
 except ValueError:
     FUNDING_SIGN_SELF_CHECK_CYCLES = 36
+
+# Skip new opens in the last N seconds before next funding (0 = off).
+_fobl = os.getenv("FUNDING_OPEN_BLOCK_LAST_SEC", "0").strip()
+try:
+    FUNDING_OPEN_BLOCK_LAST_SEC = max(0, int(_fobl))
+except ValueError:
+    FUNDING_OPEN_BLOCK_LAST_SEC = 0
+
+# After a funding-time step is observed for a symbol, block new opens on that symbol only (0 = off).
+_fopas = os.getenv("FUNDING_OPEN_PAUSE_AFTER_SETTLE_SEC", "0").strip()
+try:
+    FUNDING_OPEN_PAUSE_AFTER_SETTLE_SEC = max(0, int(_fopas))
+except ValueError:
+    FUNDING_OPEN_PAUSE_AFTER_SETTLE_SEC = 0
+
+_fsis = os.getenv("FUNDING_SYNC_IDLE_SLEEP", "false").strip().lower()
+FUNDING_SYNC_IDLE_SLEEP = _fsis in ("1", "true", "yes", "on")
+_fsi_top = os.getenv("FUNDING_SYNC_IDLE_TOP_N", "20").strip()
+try:
+    FUNDING_SYNC_IDLE_TOP_N = max(1, int(_fsi_top))
+except ValueError:
+    FUNDING_SYNC_IDLE_TOP_N = 20
+_fsi_buf = os.getenv("FUNDING_SYNC_BUFFER_SEC", "10").strip()
+try:
+    FUNDING_SYNC_BUFFER_SEC = max(0, int(_fsi_buf))
+except ValueError:
+    FUNDING_SYNC_BUFFER_SEC = 10
+
+# Settled funding history (GET /fapi/v1/fundingRate) — 0 = disabled (snapshot-only ranking).
+_fhlh = os.getenv("FUNDING_HISTORY_LOOKBACK_H", "0").strip()
+try:
+    FUNDING_HISTORY_LOOKBACK_H = max(0, int(_fhlh))
+except ValueError:
+    FUNDING_HISTORY_LOOKBACK_H = 0
+_fhtn = os.getenv("FUNDING_HISTORY_TOP_N", "20").strip()
+try:
+    FUNDING_HISTORY_TOP_N = max(1, int(_fhtn))
+except ValueError:
+    FUNDING_HISTORY_TOP_N = 20
+_fhlm = os.getenv("FUNDING_HISTORY_LIMIT", "50").strip()
+try:
+    FUNDING_HISTORY_LIMIT = max(1, min(1000, int(_fhlm)))
+except ValueError:
+    FUNDING_HISTORY_LIMIT = 50
+_fhcttl = os.getenv("FUNDING_HISTORY_CACHE_TTL_SEC", "900").strip()
+try:
+    FUNDING_HISTORY_CACHE_TTL_SEC = max(30, int(_fhcttl))
+except ValueError:
+    FUNDING_HISTORY_CACHE_TTL_SEC = 900
+_fhrw = os.getenv("FUNDING_RANK_BLEND_WEIGHT", "0").strip()
+try:
+    FUNDING_RANK_BLEND_WEIGHT = min(1.0, max(0.0, float(_fhrw)))
+except ValueError:
+    FUNDING_RANK_BLEND_WEIGHT = 0.0
+FUNDING_HISTORY_REQUIRE = os.getenv("FUNDING_HISTORY_REQUIRE", "").strip().lower()
+_fhsr = os.getenv("FUNDING_HISTORY_SPIKE_RATIO", "0").strip()
+try:
+    FUNDING_HISTORY_SPIKE_RATIO = max(0.0, float(_fhsr))
+except ValueError:
+    FUNDING_HISTORY_SPIKE_RATIO = 0.0
 
 # Fee-aware new opens (optional): skip if |lastFundingRate| is too small vs assumed round-trip taker fees.
 # Breakeven funding intervals ≈ (2 * ESTIMATED_TAKER_FEE_BPS / 10000) / abs(rate). When
@@ -700,6 +761,21 @@ def _estimate_asset_usd(
     return amount * m if m > 0 else 0.0
 
 
+def _format_qty_for_log(q: float) -> str:
+    """Format balance/qty for logs; avoid scientific notation on tiny holdings."""
+    try:
+        x = float(q)
+    except (TypeError, ValueError):
+        return str(q)
+    if x == 0.0:
+        return "0"
+    ax = abs(x)
+    if ax >= 1e-4:
+        return f"{x:.8g}"
+    s = f"{x:.12f}".rstrip("0").rstrip(".")
+    return s if s not in ("", "-0") else "0"
+
+
 def _fetch_spot_balances_non_dust(aster_price: float, mark_cache: dict) -> list:
     """Spot balances from GET /api/v3/account; drops dust vs BALANCE_DUST_USD."""
     try:
@@ -863,7 +939,9 @@ def get_collateral_summary() -> dict:
         wallet, qty = _futures_balance_margin_qty(b)
         if wallet <= 0:
             continue
-        usd = _estimate_asset_usd(asset, qty, aster_price, mark_cache)
+        # USD for display/dust must match logged wallet balance (not availableBalance).
+        # availableBalance can be a misleading cross-wallet remainder for non-base assets.
+        usd = _estimate_asset_usd(asset, wallet, aster_price, mark_cache)
         if BALANCE_DUST_USD > 0 and usd < BALANCE_DUST_USD:
             continue
         row = {"asset": asset, "balance": wallet, "est_usd": usd}
@@ -901,6 +979,9 @@ def get_aster_price() -> float:
 _next_funding_snap_ms: dict[str, int] = {}
 _funding_interval_ms_by_sym: dict[str, int] = {}
 _funding_sign_warned: set[str] = set()
+_funding_open_pause_until_ms: dict[str, int] = {}
+# symbol -> (expiry_monotonic, tuple of settled fundingRate values)
+_funding_hist_cache: dict[str, tuple[float, tuple[float, ...]]] = {}
 
 
 def _observe_next_funding_time(symbol: str, next_ms: int) -> None:
@@ -915,6 +996,11 @@ def _observe_next_funding_time(symbol: str, next_ms: int) -> None:
         # Typical perp funding: 1h–48h between settlements
         if 3_600_000 <= delta <= 48 * 3_600_000:
             _funding_interval_ms_by_sym[symbol] = int(delta)
+            if FUNDING_OPEN_PAUSE_AFTER_SETTLE_SEC > 0:
+                _funding_open_pause_until_ms[symbol] = (
+                    int(time.time() * 1000)
+                    + FUNDING_OPEN_PAUSE_AFTER_SETTLE_SEC * 1000
+                )
     _next_funding_snap_ms[symbol] = n
 
 
@@ -1026,6 +1112,246 @@ def get_all_funding_rates() -> list:
         except (KeyError, ValueError):
             continue
     return sorted(results, key=lambda x: x["fundingRate"], reverse=True)
+
+
+def funding_open_paused(symbol: str) -> bool:
+    """True if new opens on this symbol are paused until wall-clock catches up."""
+    return int(time.time() * 1000) < _funding_open_pause_until_ms.get(symbol, 0)
+
+
+def effective_next_funding_ms(
+    symbol: str,
+    rest_next_ms: int,
+    mark_watcher: Optional[object],
+) -> int:
+    """Prefer WebSocket ``T`` when the mark stream has it; else REST ``nextFundingTime``."""
+    if mark_watcher is not None:
+        try:
+            ws_t = mark_watcher.get_next_funding_time_ms(symbol)  # type: ignore[union-attr]
+        except Exception:
+            ws_t = None
+        if ws_t is not None:
+            return int(ws_t)
+    return int(rest_next_ms)
+
+
+def seconds_until_next_funding(
+    symbol: str,
+    rest_next_ms: int,
+    mark_watcher: Optional[object],
+) -> float:
+    now_ms = int(time.time() * 1000)
+    nxt = effective_next_funding_ms(symbol, rest_next_ms, mark_watcher)
+    return max(0.0, (nxt - now_ms) / 1000.0)
+
+
+def format_duration_hms(total_sec: float) -> str:
+    """Human-readable countdown from non-negative seconds."""
+    if total_sec <= 0:
+        return "0s (at/past REST nextFundingTime)"
+    t = int(total_sec)
+    h = t // 3600
+    m = (t % 3600) // 60
+    s = t % 60
+    if h > 0:
+        return f"{h}h {m}m {s}s"
+    if m > 0:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def log_startup_funding_countdowns(open_symbols: AbstractSet[str]) -> None:
+    """
+    One-shot at process start: time until nextFundingTime (REST) for open legs,
+    soonest symbol in the full snapshot list, and top-5 by lastFundingRate.
+    """
+    log_section("Funding countdown (at boot)")
+    log_info_styled(
+        f"{Style.DIM}  Same settlement clock as Aster perp UI: REST GET /fapi/v1/premiumIndex "
+        f"field nextFundingTime (per symbol).{Style.RESET_ALL}"
+    )
+    try:
+        rates = get_all_funding_rates()
+    except Exception as e:
+        log_warn(f"  Could not load premiumIndex for boot countdown: {e}")
+        return
+    now_ms = int(time.time() * 1000)
+    by_sym = {r["symbol"]: r for r in rates}
+
+    if open_symbols:
+        log_info_styled(
+            f"{Style.DIM}  Open legs — next settlement (REST nextFundingTime):{Style.RESET_ALL}"
+        )
+        for sym in sorted(open_symbols):
+            row = by_sym.get(sym)
+            if not row:
+                log_info_styled(
+                    f"  {sym}:  (symbol missing from premiumIndex snapshot)"
+                )
+                continue
+            nxt = int(row.get("nextFundingTime") or 0)
+            sec = max(0.0, (nxt - now_ms) / 1000.0) if nxt else 0.0
+            fr = float(row.get("fundingRate") or 0)
+            log_info_styled(
+                f"  {sym}  in {format_duration_hms(sec)}  "
+                f"({format_funding_pct_label(fr, sym)})"
+            )
+    else:
+        log_info_styled(
+            f"  {Style.DIM}No exchange long positions at process start.{Style.RESET_ALL}"
+        )
+
+    soon_sym: Optional[str] = None
+    soon_sec = float("inf")
+    for r in rates:
+        try:
+            nxt = int(r.get("nextFundingTime") or 0)
+        except (TypeError, ValueError):
+            continue
+        if nxt <= now_ms:
+            continue
+        sec = (nxt - now_ms) / 1000.0
+        if sec < soon_sec:
+            soon_sec = sec
+            soon_sym = str(r.get("symbol") or "")
+    if soon_sym and soon_sec < float("inf"):
+        log_info_styled(
+            f"  {Style.DIM}Soonest in full snapshot list:{Style.RESET_ALL} "
+            f"{soon_sym} in {format_duration_hms(soon_sec)}"
+        )
+
+    log_info_styled(
+        f"{Style.DIM}  Top snapshot funding (next settlement, same REST field):{Style.RESET_ALL}"
+    )
+    for r in rates[:5]:
+        sym = str(r.get("symbol") or "")
+        try:
+            nxt = int(r.get("nextFundingTime") or 0)
+        except (TypeError, ValueError):
+            nxt = 0
+        sec = max(0.0, (nxt - now_ms) / 1000.0) if nxt else 0.0
+        fr = float(r.get("fundingRate") or 0)
+        log_info_styled(
+            f"    {sym}  in {format_duration_hms(sec)}  "
+            f"({format_funding_pct_label(fr, sym)})"
+        )
+    log_info_styled(
+        f"{Style.DIM}  Per-cycle updates in main loop; markPrice WS refines next time when subscribed.{Style.RESET_ALL}"
+    )
+
+
+def _fetch_symbol_funding_rate_history_values(symbol: str) -> list[float]:
+    """Recent settled funding rates for ``symbol`` (newest-first order not guaranteed)."""
+    try:
+        end_ms = int(time.time() * 1000)
+        start_ms = end_ms - FUNDING_HISTORY_LOOKBACK_H * 3600 * 1000
+        data = get(
+            "/fapi/v1/fundingRate",
+            {
+                "symbol": symbol,
+                "startTime": start_ms,
+                "endTime": end_ms,
+                "limit": FUNDING_HISTORY_LIMIT,
+            },
+            signed=False,
+        )
+    except Exception as e:
+        log_warn(f"  fundingRate history {symbol}: {e}")
+        return []
+    if not isinstance(data, list):
+        return []
+    out: list[float] = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        try:
+            out.append(float(row.get("fundingRate") or 0))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _get_cached_funding_history_values(symbol: str) -> list[float]:
+    now_mono = time.monotonic()
+    ent = _funding_hist_cache.get(symbol)
+    if ent is not None:
+        exp_mono, vals = ent
+        if now_mono < exp_mono:
+            return list(vals)
+    vals = _fetch_symbol_funding_rate_history_values(symbol)
+    _funding_hist_cache[symbol] = (
+        now_mono + float(FUNDING_HISTORY_CACHE_TTL_SEC),
+        tuple(vals),
+    )
+    return vals
+
+
+def enrich_rates_with_funding_history(rates: list) -> list:
+    """
+    Optionally fetch settled ``/fapi/v1/fundingRate`` rows for the top-N snapshot symbols,
+    attach stats / pool_ok / rank score, and re-sort when blend weight > 0.
+    Mutates rate dicts in place.
+    """
+    if FUNDING_HISTORY_LOOKBACK_H <= 0:
+        for r in rates:
+            r["funding_hist_pool_ok"] = True
+        return rates
+
+    top_syms: list[str] = []
+    for r in rates:
+        s = r.get("symbol")
+        if not s or s in top_syms:
+            continue
+        top_syms.append(str(s))
+        if len(top_syms) >= FUNDING_HISTORY_TOP_N:
+            break
+
+    hist_by_sym: dict[str, list[float]] = {}
+    for sym in top_syms:
+        hist_by_sym[sym] = _get_cached_funding_history_values(sym)
+
+    for r in rates:
+        sym = str(r.get("symbol") or "")
+        snap = float(r.get("fundingRate") or 0)
+        r["funding_hist_pool_ok"] = True
+        r.pop("funding_hist_mean", None)
+        r.pop("funding_hist_median", None)
+        r.pop("funding_hist_min", None)
+        r.pop("funding_hist_n", None)
+        r.pop("funding_rank_score", None)
+
+        vals = hist_by_sym.get(sym)
+        if not vals:
+            r["funding_rank_score"] = snap
+            continue
+
+        r["funding_hist_n"] = len(vals)
+        mean_v = float(statistics.mean(vals))
+        r["funding_hist_mean"] = mean_v
+        r["funding_hist_median"] = float(statistics.median(vals))
+        r["funding_hist_min"] = float(min(vals))
+
+        pool_ok = True
+        if FUNDING_HISTORY_REQUIRE == "min":
+            if r["funding_hist_min"] < MIN_FUNDING_RATE:
+                pool_ok = False
+        elif FUNDING_HISTORY_REQUIRE == "median":
+            if r["funding_hist_median"] < MIN_FUNDING_RATE:
+                pool_ok = False
+
+        if FUNDING_HISTORY_SPIKE_RATIO > 0:
+            denom = max(abs(mean_v), 1e-12)
+            if abs(snap) / denom > FUNDING_HISTORY_SPIKE_RATIO:
+                pool_ok = False
+
+        r["funding_hist_pool_ok"] = pool_ok
+        blend_m = mean_v
+        w = FUNDING_RANK_BLEND_WEIGHT
+        r["funding_rank_score"] = w * snap + (1.0 - w) * blend_m
+
+    if FUNDING_RANK_BLEND_WEIGHT > 0:
+        rates.sort(key=lambda x: float(x.get("funding_rank_score") or x.get("fundingRate") or 0), reverse=True)
+    return rates
 
 
 def get_24h_quote_volumes() -> dict:
@@ -1602,6 +1928,8 @@ def is_pool_symbol_eligible(
         qv = volumes_24h.get(sym, 0.0)
         if qv < MIN_QUOTE_VOLUME_24H:
             return False
+    if FUNDING_HISTORY_LOOKBACK_H > 0 and r.get("funding_hist_pool_ok") is False:
+        return False
     return True
 
 
@@ -1612,6 +1940,8 @@ def pool_eligibility_rules_label() -> str:
         parts.append("SYMBOL_ALLOWLIST")
     if MIN_QUOTE_VOLUME_24H > 0:
         parts.append("MIN_QUOTE_VOLUME_24H")
+    if FUNDING_HISTORY_LOOKBACK_H > 0:
+        parts.append("funding_history")
     return " + ".join(parts)
 
 
@@ -2098,14 +2428,15 @@ def _emit_futures_spot_balance_tables(collateral: dict, log_fn) -> None:
             asset = r["asset"]
             bal = r["balance"]
             usd = r["est_usd"]
+            bal_s = _format_qty_for_log(bal)
             if "eff_margin" in r:
                 em = r["eff_margin"]
                 log_fn(
-                    f"    {asset:<8} balance={bal:.8g}  ~${usd:.0f}  "
+                    f"    {asset:<8} balance={bal_s}  ~${usd:.0f}  "
                     f"eff_margin≈${em:.0f}"
                 )
             else:
-                log_fn(f"    {asset:<8} balance={bal:.8g}  ~${usd:.0f}")
+                log_fn(f"    {asset:<8} balance={bal_s}  ~${usd:.0f}")
 
     log_fn(f"  Spot wallet{dust_lbl}:")
     spot = collateral.get("_spot_detail")
@@ -2116,8 +2447,8 @@ def _emit_futures_spot_balance_tables(collateral: dict, log_fn) -> None:
     else:
         for r in spot:
             log_fn(
-                f"    {r['asset']:<8} total={r['total']:.8g}  ~${r['est_usd']:.0f}  "
-                f"free={r['free']:.8g}  locked={r['locked']:.8g}"
+                f"    {r['asset']:<8} total={_format_qty_for_log(r['total'])}  ~${r['est_usd']:.0f}  "
+                f"free={_format_qty_for_log(r['free'])}  locked={_format_qty_for_log(r['locked'])}"
             )
 
 
@@ -2247,6 +2578,27 @@ def print_startup_banner(collateral: dict, aster_price: float):
         )
     log_success(f"  Max positions: {MAX_POSITIONS}")
     log_success(f"  Poll: {POLL_INTERVAL_SEC}s idle  |  {RISK_POLL_INTERVAL_SEC}s when positions open (risk)")
+    if FUNDING_OPEN_BLOCK_LAST_SEC > 0:
+        log_success(
+            f"  New-open block before funding: last {FUNDING_OPEN_BLOCK_LAST_SEC}s "
+            "(FUNDING_OPEN_BLOCK_LAST_SEC)"
+        )
+    if FUNDING_OPEN_PAUSE_AFTER_SETTLE_SEC > 0:
+        log_success(
+            f"  Post-settlement new-open pause: {FUNDING_OPEN_PAUSE_AFTER_SETTLE_SEC}s/symbol "
+            "(FUNDING_OPEN_PAUSE_AFTER_SETTLE_SEC)"
+        )
+    if FUNDING_SYNC_IDLE_SLEEP:
+        log_success(
+            f"  Idle sleep sync: cap toward next funding (top {FUNDING_SYNC_IDLE_TOP_N}, "
+            f"buffer {FUNDING_SYNC_BUFFER_SEC}s) — FUNDING_SYNC_IDLE_SLEEP"
+        )
+    if FUNDING_HISTORY_LOOKBACK_H > 0:
+        log_success(
+            f"  Funding history: lookback {FUNDING_HISTORY_LOOKBACK_H}h, top {FUNDING_HISTORY_TOP_N} "
+            f"symbols, blend W={FUNDING_RANK_BLEND_WEIGHT}, require={FUNDING_HISTORY_REQUIRE or 'off'}, "
+            f"spike_ratio={FUNDING_HISTORY_SPIKE_RATIO or 'off'}"
+        )
     log_success(f"  MARK_PRICE_WS:  {MARK_PRICE_WS}")
     log_success(f"  SHOW_BOOK_IN_LOGS:  {SHOW_BOOK_IN_LOGS}")
     dn_status = "ENABLED (set DELTA_NEUTRAL=false to disable)" if DELTA_NEUTRAL else "disabled (set DELTA_NEUTRAL=true to enable HL hedge)"
@@ -2306,6 +2658,8 @@ def run(max_cycles: int = 0) -> None:
                 f"init_stake≈${position_sizes.get(sym, 0):,.0f}"
             )
 
+    log_startup_funding_countdowns(open_symbols)
+
     mark_watcher = None
     if MARK_PRICE_WS:
         try:
@@ -2326,6 +2680,13 @@ def run(max_cycles: int = 0) -> None:
             log_warn(f"  [WS] Mark price stream not started: {e}")
             mark_watcher = None
 
+    try:
+        from code_review_scheduler import start_code_review_daemon_if_enabled
+
+        start_code_review_daemon_if_enabled()
+    except Exception as e:
+        log_warn(f"  [code_review] Could not start daemon: {e}")
+
     news_symbol_expiry: dict[str, float] = {}
     last_x_news_poll_monotonic = 0.0
     _x_boost_logged_sig: Optional[Tuple[str, ...]] = None
@@ -2343,6 +2704,7 @@ def run(max_cycles: int = 0) -> None:
             )
             log_info("  Scanning funding rates...")
             rates = get_all_funding_rates()
+            rates = enrich_rates_with_funding_history(rates)
             maybe_log_funding_sign_selfcheck(main_loop_i, open_symbols, rates)
 
             news_active: set[str] = set()
@@ -2556,8 +2918,25 @@ def run(max_cycles: int = 0) -> None:
                             "or lower ESTIMATED_TAKER_FEE_BPS to allow"
                         )
                         continue
+                    if FUNDING_OPEN_PAUSE_AFTER_SETTLE_SEC > 0 and funding_open_paused(sym):
+                        log_warn(
+                            f"  {sym} skip new open: post-settlement pause "
+                            f"(FUNDING_OPEN_PAUSE_AFTER_SETTLE_SEC={FUNDING_OPEN_PAUSE_AFTER_SETTLE_SEC}s)"
+                        )
+                        continue
+                    rest_next = int(c.get("nextFundingTime") or 0)
+                    sec_to_f = seconds_until_next_funding(sym, rest_next, mark_watcher)
+                    if FUNDING_OPEN_BLOCK_LAST_SEC > 0 and sec_to_f < float(
+                        FUNDING_OPEN_BLOCK_LAST_SEC
+                    ):
+                        log_warn(
+                            f"  {sym} skip new open: {sec_to_f:.0f}s to next funding "
+                            f"< FUNDING_OPEN_BLOCK_LAST_SEC ({FUNDING_OPEN_BLOCK_LAST_SEC}s)"
+                        )
+                        continue
                     apr      = funding_apr_pct_for_symbol(rate, sym)
-                    mins     = max(0, (c["nextFundingTime"] - int(time.time()*1000)) // 60000)
+                    eff_next = effective_next_funding_ms(sym, rest_next, mark_watcher)
+                    mins     = max(0, (eff_next - int(time.time() * 1000)) // 60000)
                     log_success(
                         f"\n  Target: {sym}  {format_funding_pct_label(rate, sym)}  "
                         f"({apr:.1f}% APR)  ${notional:.0f} notional  "
@@ -2862,7 +3241,28 @@ def run(max_cycles: int = 0) -> None:
                 )
             else:
                 sleep_sec = POLL_INTERVAL_SEC
-                log_info(f"\n  Sleeping {sleep_sec}s (scan interval, no positions)...")
+                if FUNDING_SYNC_IDLE_SLEEP and rates:
+                    now_ms = int(time.time() * 1000)
+                    deltas: list[float] = []
+                    for r in rates[:FUNDING_SYNC_IDLE_TOP_N]:
+                        try:
+                            nxt = int(r.get("nextFundingTime") or 0)
+                        except (TypeError, ValueError):
+                            continue
+                        if nxt > now_ms:
+                            deltas.append((nxt - now_ms) / 1000.0)
+                    if deltas:
+                        tmin = min(deltas)
+                        capped = max(1.0, tmin - float(FUNDING_SYNC_BUFFER_SEC))
+                        sleep_sec = int(min(float(sleep_sec), capped))
+                        log_info(
+                            f"\n  Sleeping {sleep_sec}s (scan interval, no positions; "
+                            f"FUNDING_SYNC_IDLE_SLEEP capped toward next funding)..."
+                        )
+                    else:
+                        log_info(f"\n  Sleeping {sleep_sec}s (scan interval, no positions)...")
+                else:
+                    log_info(f"\n  Sleeping {sleep_sec}s (scan interval, no positions)...")
             time.sleep(sleep_sec)
             completed_cycles += 1
             if max_cycles > 0 and completed_cycles >= max_cycles:

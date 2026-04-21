@@ -38,6 +38,8 @@ _EXTRA_LEVERS = [
     ("CYCLE_SNAPSHOT_ENABLE", "false", "Append one JSON line per farmer cycle to CYCLE_SNAPSHOT_FILE"),
     ("CYCLE_SNAPSHOT_FILE", "farmer_cycle.jsonl", "Ring-buffer path for cycle snapshots"),
     ("CLAUDE_ADVISOR_ENABLED", "false", "Allow run subcommand to call Anthropic"),
+    ("CLAUDE_ADVISOR_LOOP_ON_FLY", "false", "Docker/Fly entrypoint: background advisor loop"),
+    ("CLAUDE_ADVISOR_LOOP_SLEEP_SEC", "180", "Seconds between each claude_advisor.py run in that loop"),
     ("CLAUDE_AUTO_APPLY", "false", "Reserved — must stay false until implemented with kill-switch checks"),
 ]
 
@@ -54,7 +56,7 @@ CLAUDE_ADVISOR_LAST_RUN_FILE = os.getenv(
 CLAUDE_ADVISOR_OUT_JSONL = os.getenv(
     "CLAUDE_ADVISOR_OUT_JSONL", "claude_advisor_out.jsonl"
 ).strip() or "claude_advisor_out.jsonl"
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-5-haiku-20241022").strip()
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5").strip()
 
 
 def _env_int(name: str, default: int) -> int:

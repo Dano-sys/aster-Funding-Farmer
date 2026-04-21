@@ -1,5 +1,12 @@
 # Private worker: no [http_service] — not reachable from the public internet.
-# Set `app` to your Fly app name, then: fly secrets import < .env  (or fly secrets set KEY=...)
+# Secrets: fly secrets set KEY=...  (avoid importing a raw .env with placeholders; prefer explicit sets).
+# Pre-flight: python3 scripts/verify_fly_env.py   (add --strict to fail on alert misconfig).
+# Single machine (no duplicate orders): fly scale count 1 -a <app>
+# Optional Claude advisor on the VM: python3 scripts/push_anthropic_secret_to_fly.py
+# (funding_farmer.py does not call Anthropic; only claude_advisor.py / manual runs need it.)
+# Claude advisor loop in docker-entrypoint is OFF by default ([env] below). To enable later (after /data volume):
+#   fly secrets set CLAUDE_ADVISOR_LOOP_ON_FLY=true CLAUDE_ADVISOR_ENABLED=true ANTHROPIC_API_KEY=...
+# To turn off again: fly secrets unset CLAUDE_ADVISOR_LOOP_ON_FLY -a <app>
 # Logs: fly logs
 
 app = "aster-funding-farmer"
@@ -7,6 +14,20 @@ app = "aster-funding-farmer"
 primary_region = "fra"
 
 [build]
+
+# Persistent trades.csv / funding_farmer.log / alert state (same region as primary_region).
+# First deploy may create the volume when unset; otherwise: fly volumes create data --region fra --size 1
+[mounts]
+  source = "data"
+  destination = "/data"
+  initial_size = "1gb"
+
+[env]
+  TRADE_LOG_FILE = "/data/trades.csv"
+  FUNDING_FARMER_LOG = "/data/funding_farmer.log"
+  ALERT_WATCHER_STATE_FILE = "/data/.alert_watcher_state.json"
+  # docker-entrypoint: do not start claude_advisor loop until you opt in (secrets override this key if set).
+  CLAUDE_ADVISOR_LOOP_ON_FLY = "false"
 
 [[vm]]
   memory = "512mb"

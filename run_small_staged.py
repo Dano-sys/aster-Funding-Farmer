@@ -8,7 +8,7 @@ Small staged run: optional sizing defaults, clean slate, then funding_farmer.run
     RESERVE_SLOT_FOR_NEW_POOLS=false (skipped for keys already set, e.g. Fly secrets).
 
   --live-small  (minimal real-money for THIS PROCESS ONLY):
-  - Forces DRY_RUN=false and tight caps (overrides .env and Fly secrets for this run).
+  - Forces DRY_RUN=false and tight caps (overrides .env and Fly secrets for this process).
   - Still does not write your .env file.
   - Use --live-small-pools N for concurrent symbols (default 3). Budget floor is at least N×$20.
   - Omit --max-cycles for continuous run (e.g. Fly worker). Use --no-clean-slate on Fly so
@@ -19,18 +19,31 @@ Small staged run: optional sizing defaults, clean slate, then funding_farmer.run
   - Live: market-flattens every non-zero Aster perp (longs via close_long, shorts via exchange).
   - Does not cancel unrelated open limits; does not close Hyperliquid hedges.
 
+  Live + --max-cycles N: the process exits after N cycles without flattening real positions
+  (they stay on the exchange). For graceful flatten, run with max_cycles=0 and stop with Ctrl+C.
+
+  Optional Claude (this process only; requires ANTHROPIC_API_KEY in .env):
+  - --with-claude-advisor: background loop calling claude_advisor.py run (JSONL output).
+  - --with-code-review: enables funding_farmer's CODE_REVIEW daemon (Markdown reviews).
+  - --with-claude: both of the above.
+  - Tune: --claude-advisor-interval-sec (default 180), --code-review-interval-sec (default 3600, min 60).
+
   Examples:
     python3 run_small_staged.py --max-cycles 1
     python3 run_small_staged.py --live-small --live-small-budget 100 --max-cycles 2
     python3 run_small_staged.py --live-small --no-clean-slate --max-cycles 1
+    python3 run_small_staged.py --live-small --with-claude
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
+import threading
 from pathlib import Path
+from typing import Optional
 
 
 def _load_dotenv_repo_root() -> None:
@@ -64,6 +77,95 @@ def _apply_min_live_profile(budget_usd: int, pools: int) -> None:
     os.environ["MAX_POSITIONS"] = str(p)
     os.environ["LEVERAGE"] = "2"
     os.environ["RESERVE_SLOT_FOR_NEW_POOLS"] = "false"
+
+
+def _apply_code_review_staging_env(interval_sec: int) -> None:
+    """In-process periodic reviews when funding_farmer.run() starts (see code_review_scheduler)."""
+    sec = max(60, int(interval_sec))
+    os.environ["CODE_REVIEW_ENABLED"] = "true"
+    os.environ["CODE_REVIEW_INTERVAL_SEC"] = str(sec)
+    os.environ["CODE_REVIEW_RUN_ONCE_ON_START"] = "true"
+
+
+def _apply_claude_advisor_staging_env() -> None:
+    os.environ["CLAUDE_ADVISOR_ENABLED"] = "true"
+    os.environ["CLAUDE_ADVISOR_MIN_INTERVAL_SEC"] = "0"
+
+
+class _ClaudeAdvisorLoop:
+    """Background loop: subprocess claude_advisor.py run until stop()."""
+
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._proc: Optional[subprocess.Popen] = None
+        self._proc_lock = threading.Lock()
+
+    def _loop(self, repo_root: Path, interval_sec: int) -> None:
+        advisor = repo_root / "claude_advisor.py"
+        first = True
+        while not self._stop.is_set():
+            if not first:
+                if self._stop.wait(timeout=interval_sec):
+                    return
+            first = False
+            if self._stop.is_set():
+                return
+            proc = subprocess.Popen(
+                [sys.executable, str(advisor), "run"],
+                cwd=str(repo_root),
+                env=os.environ.copy(),
+            )
+            with self._proc_lock:
+                self._proc = proc
+            try:
+                while proc.poll() is None:
+                    if self._stop.wait(timeout=0.5):
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=30)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                        return
+            finally:
+                with self._proc_lock:
+                    self._proc = None
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=20)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                rc = proc.returncode
+                if rc not in (0, None) and not self._stop.is_set():
+                    print(
+                        f"[run_small_staged] claude_advisor.py run exited {rc} "
+                        "(pip install anthropic? CLAUDE_ADVISOR_ENABLED / ANTHROPIC_API_KEY?)",
+                        file=sys.stderr,
+                    )
+
+    def start(self, repo_root: Path, interval_sec: int) -> None:
+        self._thread = threading.Thread(
+            target=self._loop,
+            args=(repo_root, interval_sec),
+            name="claude_advisor_loop",
+            daemon=False,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        with self._proc_lock:
+            p = self._proc
+            if p is not None and p.poll() is None:
+                p.terminate()
+        if self._thread is not None:
+            self._thread.join(timeout=30)
+            if self._thread.is_alive():
+                with self._proc_lock:
+                    p = self._proc
+                    if p is not None and p.poll() is None:
+                        p.kill()
 
 
 def _staging_clean_slate(ff) -> None:
@@ -102,6 +204,7 @@ def _staging_clean_slate(ff) -> None:
 
 def main() -> None:
     _load_dotenv_repo_root()
+    repo_root = Path(__file__).resolve().parent
 
     ap = argparse.ArgumentParser(
         description=(
@@ -146,6 +249,35 @@ def main() -> None:
         metavar="N",
         help="With --live-small: MAX_POSITIONS / concurrent symbols (default 3, max 20).",
     )
+    ap.add_argument(
+        "--with-claude-advisor",
+        action="store_true",
+        help="Background loop: claude_advisor.py run on an interval (needs ANTHROPIC_API_KEY).",
+    )
+    ap.add_argument(
+        "--with-code-review",
+        action="store_true",
+        help="Enable in-process CODE_REVIEW daemon inside funding_farmer (Markdown reviews).",
+    )
+    ap.add_argument(
+        "--with-claude",
+        action="store_true",
+        help="Shorthand for --with-claude-advisor and --with-code-review.",
+    )
+    ap.add_argument(
+        "--claude-advisor-interval-sec",
+        type=int,
+        default=180,
+        metavar="N",
+        help="Seconds between claude_advisor.py runs (default 180).",
+    )
+    ap.add_argument(
+        "--code-review-interval-sec",
+        type=int,
+        default=3600,
+        metavar="N",
+        help="CODE_REVIEW_INTERVAL_SEC for this process (default 3600, min 60).",
+    )
     args = ap.parse_args()
     if args.max_cycles < 0:
         ap.error("--max-cycles must be >= 0")
@@ -153,6 +285,13 @@ def main() -> None:
         ap.error("--live-small-pools must be 1–20")
     if args.live_small_budget < 30:
         ap.error("--live-small-budget must be >= 30")
+    if args.claude_advisor_interval_sec < 10:
+        ap.error("--claude-advisor-interval-sec must be >= 10")
+    if args.code_review_interval_sec < 60:
+        ap.error("--code-review-interval-sec must be >= 60")
+
+    want_advisor = args.with_claude_advisor or args.with_claude
+    want_code_review = args.with_code_review or args.with_claude
 
     if args.live_small:
         _apply_min_live_profile(args.live_small_budget, args.live_small_pools)
@@ -176,6 +315,27 @@ def main() -> None:
         )
         sys.exit(1)
 
+    if want_code_review:
+        _apply_code_review_staging_env(args.code_review_interval_sec)
+    if want_advisor:
+        _apply_claude_advisor_staging_env()
+
+    if want_advisor or want_code_review:
+        bits = []
+        if want_advisor:
+            bits.append(
+                f"claude_advisor loop every {args.claude_advisor_interval_sec}s"
+            )
+        if want_code_review:
+            bits.append(
+                f"code_review interval {max(60, args.code_review_interval_sec)}s "
+                "(run once on start)"
+            )
+        print(
+            f">>> run_small_staged: Claude — {'; '.join(bits)}\n",
+            file=sys.stderr,
+        )
+
     import funding_farmer as ff
 
     if args.live_small and ff.DELTA_NEUTRAL:
@@ -185,10 +345,18 @@ def main() -> None:
             file=sys.stderr,
         )
 
-    if not args.no_clean_slate:
-        _staging_clean_slate(ff)
+    advisor_loop: Optional[_ClaudeAdvisorLoop] = None
+    if want_advisor:
+        advisor_loop = _ClaudeAdvisorLoop()
+        advisor_loop.start(repo_root, args.claude_advisor_interval_sec)
 
-    ff.run(max_cycles=args.max_cycles)
+    try:
+        if not args.no_clean_slate:
+            _staging_clean_slate(ff)
+        ff.run(max_cycles=args.max_cycles)
+    finally:
+        if advisor_loop is not None:
+            advisor_loop.stop()
 
 
 if __name__ == "__main__":

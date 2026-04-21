@@ -64,10 +64,29 @@ CONFIG_KEYS = [
     "FARMING_HALT_FILE",
     "CYCLE_SNAPSHOT_ENABLE",
     "CYCLE_SNAPSHOT_FILE",
+    "FUNDING_OPEN_BLOCK_LAST_SEC",
+    "FUNDING_OPEN_PAUSE_AFTER_SETTLE_SEC",
+    "FUNDING_SYNC_IDLE_SLEEP",
+    "FUNDING_HISTORY_LOOKBACK_H",
+    "FUNDING_RANK_BLEND_WEIGHT",
     "CLAUDE_ADVISOR_ENABLED",
+    "CLAUDE_ADVISOR_LOOP_ON_FLY",
+    "CLAUDE_ADVISOR_LOOP_SLEEP_SEC",
     "CLAUDE_ADVISOR_MIN_INTERVAL_SEC",
     "CLAUDE_AUTO_APPLY",
 ]
+
+
+def _seconds_to_funding(next_ms: Any) -> Optional[int]:
+    """Whole seconds until nextFundingTime; None if unknown."""
+    try:
+        n = int(next_ms)
+    except (TypeError, ValueError):
+        return None
+    now_ms = int(time.time() * 1000)
+    if n <= now_ms:
+        return 0
+    return (n - now_ms) // 1000
 
 
 def _json_safe(obj: Any) -> Any:
@@ -339,17 +358,37 @@ def build_snapshot() -> dict:
     raw_pos: List[dict] = []
     try:
         raw_pos = ff.get_positions()
-        out["positions"] = [_json_safe(p) for p in raw_pos]
     except Exception as e:
         out["errors"].append(f"Positions: {e}")
-        out["positions"] = []
+        raw_pos = []
 
+    rates: List[dict] = []
     try:
         rates = ff.get_all_funding_rates()
-        out["funding_top"] = rates[:60]
+        rates = ff.enrich_rates_with_funding_history(rates)
+        top_rows: List[dict] = []
+        for r in rates[:60]:
+            row = dict(r)
+            row["secondsToFunding"] = _seconds_to_funding(row.get("nextFundingTime"))
+            top_rows.append(row)
+        out["funding_top"] = top_rows
     except Exception as e:
         out["errors"].append(f"Funding rates: {e}")
         out["funding_top"] = []
+
+    rate_by_sym = {
+        str(r["symbol"]): r for r in rates if isinstance(r, dict) and r.get("symbol")
+    }
+    pos_out: List[Any] = []
+    for p in raw_pos:
+        row = dict(p)
+        sym = row.get("symbol")
+        if sym and sym in rate_by_sym:
+            rr = rate_by_sym[sym]
+            row["nextFundingTime"] = rr.get("nextFundingTime")
+            row["secondsToFunding"] = _seconds_to_funding(rr.get("nextFundingTime"))
+        pos_out.append(_json_safe(row))
+    out["positions"] = pos_out
 
     vol: dict = {}
     ex: dict = {}
@@ -365,23 +404,26 @@ def build_snapshot() -> dict:
     eligible: List[dict] = []
     volume_active = ff.MIN_QUOTE_VOLUME_24H > 0
     try:
-        for r in ff.get_all_funding_rates():
+        for r in rates:
             if ff.is_pool_symbol_eligible(r, ex, vol, volume_active):
                 qsym = r["symbol"]
                 fr = float(r.get("fundingRate", 0))
                 fpd = float(r.get("fundingsPerDay") or ff.fundings_per_day(qsym))
-                eligible.append(
-                    {
-                        "symbol": qsym,
-                        "fundingRate": fr,
-                        "fundingsPerDay": round(fpd, 6),
-                        "funding_apr_pct": round(
-                            ff.funding_apr_pct_for_symbol(fr, qsym), 4
-                        ),
-                        "markPrice": r.get("markPrice"),
-                        "quoteVolume24h": vol.get(qsym, 0.0),
-                    }
-                )
+                erow: dict = {
+                    "symbol": qsym,
+                    "fundingRate": fr,
+                    "fundingsPerDay": round(fpd, 6),
+                    "funding_apr_pct": round(
+                        ff.funding_apr_pct_for_symbol(fr, qsym), 4
+                    ),
+                    "markPrice": r.get("markPrice"),
+                    "quoteVolume24h": vol.get(qsym, 0.0),
+                    "nextFundingTime": r.get("nextFundingTime"),
+                    "secondsToFunding": _seconds_to_funding(r.get("nextFundingTime")),
+                }
+                if r.get("funding_hist_mean") is not None:
+                    erow["funding_hist_mean"] = float(r["funding_hist_mean"])
+                eligible.append(erow)
             if len(eligible) >= 25:
                 break
     except Exception as e:
@@ -545,6 +587,18 @@ INDEX_HTML = """<!DOCTYPE html>
     const s = n >= 0 ? '+' : '';
     return s + n.toFixed(d);
   }
+  function fmtCountdown(sec) {
+    if (sec === null || sec === undefined || sec === '') return '—';
+    const n = Number(sec);
+    if (!Number.isFinite(n)) return '—';
+    if (n <= 0) return 'due';
+    const h = Math.floor(n / 3600);
+    const m = Math.floor((n % 3600) / 60);
+    const secRem = n % 60;
+    if (h > 0) return h + 'h ' + m + 'm';
+    if (m > 0) return m + 'm ' + secRem + 's';
+    return secRem + 's';
+  }
   function pnlClass(n) {
     if (n === null || n === undefined || n === '') return '';
     const x = Number(n);
@@ -676,16 +730,17 @@ INDEX_HTML = """<!DOCTYPE html>
     if (!pos.length) {
       html += '<p style="color:var(--muted);margin:0">No open perp positions.</p>';
     } else {
-      html += '<table><thead><tr><th>Symbol</th><th class="num">Qty</th><th class="num">Entry</th><th class="num">Mark</th><th class="num">uPnL</th><th>Side</th></tr></thead><tbody>';
+      html += '<table><thead><tr><th>Symbol</th><th class="num">Qty</th><th class="num">Entry</th><th class="num">Mark</th><th class="num">uPnL</th><th class="num">Next in</th><th>Side</th></tr></thead><tbody>';
       for (const p of pos) {
         const u = p.unRealizedProfit !== undefined ? p.unRealizedProfit : p.unrealizedProfit;
         html += '<tr><td>' + esc(p.symbol) + '</td><td class="num">' + fmtNum(p.positionAmt, 6)
           + '</td><td class="num">' + fmtNum(p.entryPrice, 6) + '</td><td class="num">' + fmtNum(p.markPrice, 6)
-          + '</td><td class="num">' + fmtNum(u, 4) + '</td><td>' + esc(p.positionSide || '—') + '</td></tr>';
+          + '</td><td class="num">' + fmtNum(u, 4) + '</td><td class="num">' + fmtCountdown(p.secondsToFunding)
+          + '</td><td>' + esc(p.positionSide || '—') + '</td></tr>';
       }
       html += '</tbody><tfoot><tr><td>Total</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num '
         + pnlClass(sum.unrealized_pnl_usdt) + '">'
-        + fmtSigned(sum.unrealized_pnl_usdt, 4) + '</td><td>—</td></tr></tfoot></table>';
+        + fmtSigned(sum.unrealized_pnl_usdt, 4) + '</td><td class="num">—</td><td>—</td></tr></tfoot></table>';
     }
     html += '</section>';
 
@@ -695,10 +750,12 @@ INDEX_HTML = """<!DOCTYPE html>
     if (!el.length) {
       html += '<p style="color:var(--muted);margin:0">No symbols pass current filters (or data error).</p>';
     } else {
-      html += '<table><thead><tr><th>Symbol</th><th class="num">Funding / interval</th><th class="num">APR %</th><th class="num">Mark</th><th class="num">24h quote vol</th></tr></thead><tbody>';
+      html += '<table><thead><tr><th>Symbol</th><th class="num">Funding / interval</th><th class="num">APR %</th><th class="num">Mark</th><th class="num">Next in</th><th class="num">Hist μ</th><th class="num">24h quote vol</th></tr></thead><tbody>';
       for (const r of el) {
         html += '<tr><td>' + esc(r.symbol) + '</td><td class="num">' + fmtNum(r.fundingRate, 6)
           + '</td><td class="num">' + fmtNum(r.funding_apr_pct, 2) + '</td><td class="num">' + fmtNum(r.markPrice, 6)
+          + '</td><td class="num">' + fmtCountdown(r.secondsToFunding)
+          + '</td><td class="num">' + (r.funding_hist_mean !== undefined && r.funding_hist_mean !== null ? fmtNum(r.funding_hist_mean, 6) : '—')
           + '</td><td class="num">' + fmtNum(r.quoteVolume24h, 0) + '</td></tr>';
       }
       html += '</tbody></table>';
@@ -707,13 +764,15 @@ INDEX_HTML = """<!DOCTYPE html>
 
     html += '<section><h2>Top funding rates (all perps)</h2>';
     const top = data.funding_top || [];
-    html += '<table><thead><tr><th>Symbol</th><th class="num">Funding / interval</th><th class="num">APR %</th><th class="num">Mark</th></tr></thead><tbody>';
+    html += '<table><thead><tr><th>Symbol</th><th class="num">Funding / interval</th><th class="num">APR %</th><th class="num">Mark</th><th class="num">Next in</th><th class="num">Hist μ</th></tr></thead><tbody>';
     for (const r of top) {
       const fr = Number(r.fundingRate);
       const fpd = Number(r.fundingsPerDay) || 3;
       const apr = fr * fpd * 365 * 100;
       html += '<tr><td>' + esc(r.symbol) + '</td><td class="num">' + fmtNum(r.fundingRate, 6)
-        + '</td><td class="num">' + fmtNum(apr, 2) + '</td><td class="num">' + fmtNum(r.markPrice, 6) + '</td></tr>';
+        + '</td><td class="num">' + fmtNum(apr, 2) + '</td><td class="num">' + fmtNum(r.markPrice, 6)
+        + '</td><td class="num">' + fmtCountdown(r.secondsToFunding)
+        + '</td><td class="num">' + (r.funding_hist_mean !== undefined && r.funding_hist_mean !== null ? fmtNum(r.funding_hist_mean, 6) : '—') + '</td></tr>';
     }
     html += '</tbody></table></section>';
 

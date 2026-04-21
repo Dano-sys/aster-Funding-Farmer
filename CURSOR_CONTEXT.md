@@ -359,6 +359,8 @@ run()
 ```bash
 fly launch --name aster-farmer
 fly secrets set ASTER_USER=0x... ASTER_SIGNER=0x... ASTER_SIGNER_PRIVATE_KEY=0x...
+python3 scripts/verify_fly_env.py
+fly scale count 1 -a aster-farmer
 fly deploy
 ```
 
@@ -367,8 +369,9 @@ For delta_neutral.py, also set:
 fly secrets set HL_PRIVATE_KEY=xxx HL_WALLET_ADDRESS=xxx
 ```
 
-trades.csv and logs persist within the container. For persistent storage across
-deploys, mount a Fly volume and set `TRADE_LOG_FILE=/data/trades.csv`.
+`fly.toml` mounts a `data` volume at `/data` and sets `TRADE_LOG_FILE`, `FUNDING_FARMER_LOG`,
+and `ALERT_WATCHER_STATE_FILE` under `/data` so trades and logs survive redeploys. Create the
+volume in the app region if deploy asks (e.g. `fly volumes create data --region fra --size 1`).
 
 ---
 
