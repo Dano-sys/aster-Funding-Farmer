@@ -100,6 +100,10 @@ Output ONLY valid JSON (no markdown fences), one object, with exactly these keys
 - points_vs_carry_notes: string, <= 500 chars (dollar carry vs Aster Stage 6-style points tradeoffs)
 Be conservative: illiquidity -> suggest MIN_QUOTE_VOLUME_24H or SYMBOL_ALLOWLIST, not leverage increases.
 Code hints must tie to observed log/trade evidence, not broad refactors.
+For suggested_code_changes "file", use ONLY real paths in this repo (e.g. funding_farmer.py, exchange.py, delta_neutral.py, aster_client.py, aster_ws.py, alert_watcher.py). Never invent packages like bot/position_manager.py.
+RESERVE_SLOT_FOR_NEW_POOLS semantics: when true (and RESERVE_DEPLOY_PCT unset), effective max total notional is reduced by ~1/MAX_POSITIONS — that is notional cap headroom for new pool names. When false, RESERVE_DEPLOY_PCT is 0 and the full deploy budget cap can be filled. Do not recommend flipping this flag to "create dry powder" without verifying that goal; pairing RESERVE_SLOT_FOR_NEW_POOLS=true with lower WALLET_DEPLOY_PCT is the usual way to keep headroom.
+DRY_RUN=false with DRY_RUN_SIMULATED_MARGIN_USD=0 is normal live sizing from API margin, not a hybrid "SIM margin" mode. DRY_RUN=true simulates orders; [SIM] position tags in logs refer to simulated fills when dry-run is on.
+Startup logs include a single "Resolved env:" line with MAX_POSITIONS, MIN_QUOTE_VOLUME_24H, DRY_RUN, etc. — prefer that over guessing .env.example staging sections vs Fly secrets.
 """
 
 

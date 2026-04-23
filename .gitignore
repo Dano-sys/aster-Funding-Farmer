@@ -1,8 +1,11 @@
 .env
+# Local config override (config.py loads it after .env) — do not commit; can force DRY_RUN=true in deploys
+/env
 funding_farmer.log
 trades.csv
 trades_dry_run.csv
 trades_dry_run.csv.*_backup
+trades.csv.header_backup
 __pycache__/
 *.pyc
 farmer_cycle.jsonl
@@ -11,3 +14,10 @@ claude_advisor_out.jsonl
 .alert_watcher_state.json
 reviews/
 .code_review_last_run
+
+# Local-only artifacts from Fly log analysis
+fly-logs/
+reports/
+
+# Cursor local rules / editor metadata
+.cursor/

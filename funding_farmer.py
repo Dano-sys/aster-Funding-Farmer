@@ -37,7 +37,7 @@ import re
 import csv
 import statistics
 import time
-from typing import AbstractSet, List, Optional, Tuple
+from typing import AbstractSet, Dict, List, Optional, Set, Tuple
 import logging
 import requests
 from decimal import Decimal, ROUND_DOWN
@@ -248,6 +248,44 @@ except ValueError:
 BLACKLIST         = [s for s in os.getenv("BLACKLIST", "").split(",") if s]
 TRADE_LOG_FILE    = os.getenv("TRADE_LOG_FILE", "trades.csv")
 
+# Stop-loss–driven cooldown: skip NEW opens after N stop-loss closes in W hours (rolling).
+_slab = os.getenv("STOP_LOSS_AUTO_BLACKLIST", "false").strip().lower()
+STOP_LOSS_AUTO_BLACKLIST = _slab in ("1", "true", "yes", "on")
+_slabn = os.getenv("STOP_LOSS_BLACKLIST_COUNT", "3").strip()
+try:
+    STOP_LOSS_BLACKLIST_COUNT = max(1, int(_slabn))
+except ValueError:
+    STOP_LOSS_BLACKLIST_COUNT = 3
+_slabw = os.getenv("STOP_LOSS_BLACKLIST_WINDOW_H", "168").strip()
+try:
+    STOP_LOSS_BLACKLIST_WINDOW_H = max(0.01, float(_slabw))
+except ValueError:
+    STOP_LOSS_BLACKLIST_WINDOW_H = 168.0
+STOP_LOSS_BLACKLIST_STATE_FILE = (
+    os.getenv("STOP_LOSS_BLACKLIST_STATE_FILE", ".stop_loss_blacklist_state.json").strip()
+    or ".stop_loss_blacklist_state.json"
+)
+_slaboot = os.getenv("STOP_LOSS_BLACKLIST_BOOTSTRAP_FROM_CSV", "false").strip().lower()
+STOP_LOSS_BLACKLIST_BOOTSTRAP_FROM_CSV = _slaboot in ("1", "true", "yes", "on")
+
+_STOP_LOSS_CLOSE_REASONS = frozenset({"stop_loss", "stop_loss_ws"})
+# Refreshed once per main loop iteration when STOP_LOSS_AUTO_BLACKLIST is enabled.
+_stop_loss_cooldown_symbols: Set[str] = set()
+
+# Guard against accidental repeated opens (e.g. retries / duplicate cycles / external churn).
+_oacs = os.getenv("OPEN_ATTEMPT_COOLDOWN_SEC", "60").strip()
+try:
+    OPEN_ATTEMPT_COOLDOWN_SEC = max(0.0, float(_oacs))
+except ValueError:
+    OPEN_ATTEMPT_COOLDOWN_SEC = 60.0
+
+# After a stop-loss close, skip NEW opens of the same symbol for a short cooldown window.
+_slrc = os.getenv("STOP_LOSS_REENTRY_COOLDOWN_SEC", "300").strip()
+try:
+    STOP_LOSS_REENTRY_COOLDOWN_SEC = max(0.0, float(_slrc))
+except ValueError:
+    STOP_LOSS_REENTRY_COOLDOWN_SEC = 300.0
+
 # Pool quality (liquidity): min trailing 24h USDT quote volume from GET /fapi/v1/ticker/24hr.
 # 0 = no filter (legacy: chase top funding regardless of depth). Typical values: 1e6–2e7 for liquid alts/majors.
 MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "0") or 0)
@@ -264,6 +302,11 @@ WALLET_DEPLOY_PCT = float(os.getenv("WALLET_DEPLOY_PCT", "0.80"))
 WALLET_MAX_USD    = float(os.getenv("WALLET_MAX_USD", "0"))
 # Never deploy less than this (avoids tiny below-minimum positions)
 WALLET_MIN_USD    = float(os.getenv("WALLET_MIN_USD", "20"))
+_mslot = os.getenv("MIN_SLOT_USD", "").strip()
+try:
+    MIN_SLOT_USD = float(_mslot) if _mslot else WALLET_MIN_USD
+except ValueError:
+    MIN_SLOT_USD = WALLET_MIN_USD
 
 # Dry run mode
 # true  = live API reads (rates, marks, balances) + same sizing math as live, but perp orders are
@@ -315,6 +358,12 @@ MAX_POSITIONS       = int(os.getenv("MAX_POSITIONS", "7"))
 RANK_TOP_PCT        = float(os.getenv("RANK_TOP_PCT", "0.25"))
 # Hard cap per symbol as % of total budget (prevents over-concentration)
 MAX_SINGLE_PCT      = float(os.getenv("MAX_SINGLE_PCT", "0.30"))
+# rank_weighted (default) | equal | funding_linear — split_budget for candidates / resize targets
+_alloc_raw = os.getenv("ALLOCATION_MODE", "rank_weighted").strip().lower()
+if _alloc_raw in ("rank_weighted", "equal", "funding_linear"):
+    ALLOCATION_MODE = _alloc_raw
+else:
+    ALLOCATION_MODE = "rank_weighted"
 # Correlated pairs to avoid holding simultaneously (comma-sep, pipe-delimited groups)
 # e.g. "BTCUSDT|WBTCUSDT,ETHUSDT|STETHUSDT" = don't hold BTC+WBTC or ETH+STETH together
 CORR_GROUPS_RAW     = os.getenv("CORR_GROUPS", "BTCUSDT|WBTCUSDT,ETHUSDT|STETHUSDT|WETHUSDT")
@@ -335,6 +384,24 @@ elif _reserve_slot:
 else:
     RESERVE_DEPLOY_PCT = 0.0
 RESERVE_SLOT_FOR_NEW_POOLS = _reserve_slot
+
+# When true: effective concurrent slots = min(MAX_POSITIONS, max(1, deploy_cap // max(WALLET_MIN_USD, MIN_SLOT_USD))).
+MAX_POSITIONS_AUTO = os.getenv("MAX_POSITIONS_AUTO", "false").lower() == "true"
+
+# Optional: scale existing Aster longs toward deploy_cap split (ignored when DELTA_NEUTRAL=true).
+RESIZE_OPEN_LONGS = os.getenv("RESIZE_OPEN_LONGS", "false").lower() == "true"
+try:
+    RESIZE_MIN_INTERVAL_SEC = max(0.0, float(os.getenv("RESIZE_MIN_INTERVAL_SEC", "3600")))
+except ValueError:
+    RESIZE_MIN_INTERVAL_SEC = 3600.0
+try:
+    RESIZE_MIN_DELTA_USD = max(0.0, float(os.getenv("RESIZE_MIN_DELTA_USD", "25")))
+except ValueError:
+    RESIZE_MIN_DELTA_USD = 25.0
+try:
+    RESIZE_BAND_PCT = max(0.0, float(os.getenv("RESIZE_BAND_PCT", "0.02")))
+except ValueError:
+    RESIZE_BAND_PCT = 0.02
 
 # One JSON line per cycle for alerts / advisors (default off).
 _cs = os.getenv("CYCLE_SNAPSHOT_ENABLE", "").strip().lower()
@@ -470,6 +537,15 @@ _open_trades: dict = {}
 _dry_positions: dict = {}
 _dry_order_seq: list = [0]  # mutable int for sequence counter
 
+# Last monotonic time we resized (market-added) each symbol — rate limit for RESIZE_OPEN_LONGS
+_resize_last_mono: Dict[str, float] = {}
+
+# Last monotonic time we attempted a new long open per symbol — prevents duplicate opens/retries.
+_open_attempt_last_mono: Dict[str, float] = {}
+
+# Last monotonic time we stop-loss closed per symbol — prevents immediate re-entry churn.
+_stop_loss_close_last_mono: Dict[str, float] = {}
+
 def _dry_order_id(symbol: str) -> str:
     _dry_order_seq[0] += 1
     return f"DRY_{symbol}_{_dry_order_seq[0]}"
@@ -586,6 +662,194 @@ def _append_csv(row: dict):
     with open(TRADE_LOG_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=TRADE_CSV_HEADERS)
         writer.writerow({h: row.get(h, "") for h in TRADE_CSV_HEADERS})
+
+
+def _stop_loss_blacklist_window_sec() -> float:
+    return float(STOP_LOSS_BLACKLIST_WINDOW_H) * 3600.0
+
+
+def _load_stop_loss_blacklist_state() -> Dict[str, List[float]]:
+    path = STOP_LOSS_BLACKLIST_STATE_FILE
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        log_warn(f"  [sl_blacklist] could not read state file {path}: {e}")
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, List[float]] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str) or not k.strip():
+            continue
+        sym = k.strip().upper()
+        if not isinstance(v, list):
+            continue
+        ts_list: List[float] = []
+        for x in v:
+            try:
+                ts_list.append(float(x))
+            except (TypeError, ValueError):
+                continue
+        if ts_list:
+            out[sym] = ts_list
+    return out
+
+
+def _save_stop_loss_blacklist_state(state: Dict[str, List[float]]) -> None:
+    path = STOP_LOSS_BLACKLIST_STATE_FILE
+    d = os.path.dirname(os.path.abspath(path))
+    if d and not os.path.isdir(d):
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError as e:
+            log_warn(f"  [sl_blacklist] could not create directory {d}: {e}")
+            return
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, separators=(",", ":"))
+        os.replace(tmp, path)
+    except OSError as e:
+        log_warn(f"  [sl_blacklist] could not write state file {path}: {e}")
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _prune_stop_loss_blacklist_state(
+    state: Dict[str, List[float]], cutoff: float
+) -> Dict[str, List[float]]:
+    pruned: Dict[str, List[float]] = {}
+    for sym, events in state.items():
+        kept = [t for t in events if t >= cutoff]
+        if kept:
+            pruned[sym] = kept
+    return pruned
+
+
+def _stop_loss_blacklist_symbols_over_threshold(
+    state: Dict[str, List[float]], *, now: float, count: int, window_sec: float
+) -> Set[str]:
+    cutoff = now - window_sec
+    out: Set[str] = set()
+    for sym, events in state.items():
+        recent = [t for t in events if t >= cutoff]
+        if len(recent) >= count:
+            out.add(sym)
+    return out
+
+
+def _set_stop_loss_cooldown_from_state(state: Dict[str, List[float]]) -> None:
+    global _stop_loss_cooldown_symbols
+    if not STOP_LOSS_AUTO_BLACKLIST:
+        _stop_loss_cooldown_symbols = set()
+        return
+    now = time.time()
+    window_sec = _stop_loss_blacklist_window_sec()
+    _stop_loss_cooldown_symbols = _stop_loss_blacklist_symbols_over_threshold(
+        state, now=now, count=STOP_LOSS_BLACKLIST_COUNT, window_sec=window_sec
+    )
+
+
+def refresh_stop_loss_blacklist_cache() -> None:
+    """Prune state file, recompute symbols over threshold (call once per main loop)."""
+    global _stop_loss_cooldown_symbols
+    if not STOP_LOSS_AUTO_BLACKLIST:
+        _stop_loss_cooldown_symbols = set()
+        return
+    now = time.time()
+    window_sec = _stop_loss_blacklist_window_sec()
+    cutoff = now - window_sec
+    state = _load_stop_loss_blacklist_state()
+    pruned = _prune_stop_loss_blacklist_state(state, cutoff)
+    if pruned != state:
+        _save_stop_loss_blacklist_state(pruned)
+        state = pruned
+    _set_stop_loss_cooldown_from_state(state)
+
+
+def record_stop_loss_blacklist_event(symbol: str, close_reason: str) -> None:
+    if not STOP_LOSS_AUTO_BLACKLIST:
+        return
+    if close_reason not in _STOP_LOSS_CLOSE_REASONS:
+        return
+    sym = symbol.strip().upper()
+    if not sym:
+        return
+    now = time.time()
+    window_sec = _stop_loss_blacklist_window_sec()
+    cutoff = now - window_sec
+    state = _load_stop_loss_blacklist_state()
+    state = _prune_stop_loss_blacklist_state(state, cutoff)
+    state.setdefault(sym, []).append(now)
+    _save_stop_loss_blacklist_state(state)
+    _set_stop_loss_cooldown_from_state(state)
+
+
+def _parse_trade_csv_timestamp_utc(s: str) -> Optional[float]:
+    raw = (s or "").strip()
+    if len(raw) < 19:
+        return None
+    try:
+        dt = datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except ValueError:
+        return None
+
+
+def maybe_bootstrap_stop_loss_blacklist_from_csv() -> None:
+    if not STOP_LOSS_AUTO_BLACKLIST or not STOP_LOSS_BLACKLIST_BOOTSTRAP_FROM_CSV:
+        return
+    existing = _load_stop_loss_blacklist_state()
+    if any(existing.values()):
+        log_info(
+            "  [sl_blacklist] bootstrap skipped: state file already has stop-loss events"
+        )
+        return
+    if not os.path.isfile(TRADE_LOG_FILE):
+        log_info("  [sl_blacklist] bootstrap skipped: no trade log file")
+        return
+    now = time.time()
+    window_sec = _stop_loss_blacklist_window_sec()
+    cutoff = now - window_sec
+    merged: Dict[str, List[float]] = {}
+    try:
+        with open(TRADE_LOG_FILE, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            fn = reader.fieldnames or ()
+            if "action" not in fn or "symbol" not in fn:
+                log_warn("  [sl_blacklist] bootstrap skipped: trade log missing columns")
+                return
+            for row in reader:
+                if (row.get("action") or "").strip().upper() != "CLOSE":
+                    continue
+                reason = (row.get("close_reason") or "").strip()
+                if reason not in _STOP_LOSS_CLOSE_REASONS:
+                    continue
+                sym = (row.get("symbol") or "").strip().upper()
+                if not sym:
+                    continue
+                ts = _parse_trade_csv_timestamp_utc(row.get("timestamp_utc") or "")
+                if ts is None or ts < cutoff:
+                    continue
+                merged.setdefault(sym, []).append(ts)
+    except OSError as e:
+        log_warn(f"  [sl_blacklist] bootstrap read failed: {e}")
+        return
+    for sym in merged:
+        merged[sym].sort()
+    _save_stop_loss_blacklist_state(merged)
+    n_ev = sum(len(v) for v in merged.values())
+    log_success(
+        f"  [sl_blacklist] bootstrapped {n_ev} event(s) across {len(merged)} symbol(s) "
+        f"from {TRADE_LOG_FILE}"
+    )
+
 
 def log_trade_open(
     symbol: str,
@@ -709,6 +973,9 @@ def log_trade_close(
             f"  @ {exit_price:.4f}  pnl=n/a (no entry cache)"
             f"  held={hold_mins}m  reason={close_reason}"
         )
+    record_stop_loss_blacklist_event(symbol, close_reason)
+    if close_reason in _STOP_LOSS_CLOSE_REASONS and STOP_LOSS_REENTRY_COOLDOWN_SEC > 0:
+        _stop_loss_close_last_mono[symbol] = time.monotonic()
 
 # --- Account Setup ------------------------------------------------------------
 
@@ -1655,10 +1922,23 @@ def open_long(symbol: str, notional_usdt: float, exchange_info: dict,
     log_info(f"  Opening LONG {symbol}  qty={qty_str}  ~${notional_usdt:.0f} notional")
     order = ex.place_market_order_raw(symbol=symbol, side="BUY", quantity=qty_str)
     log_success(f"  [OK] Opened orderId={order.get('orderId')} status={order.get('status')}")
-    avg_px, ex_qty, fee_open = resolve_live_fill_and_fees(symbol, order)
+    try:
+        avg_px, ex_qty, fee_open = resolve_live_fill_and_fees(symbol, order)
+    except Exception as e:
+        log_warn(
+            f"  Fill/fee resolution incomplete for {symbol}: {e} — "
+            "position may be live; state will sync from exchange next cycle"
+        )
+        avg_px, ex_qty, fee_open = 0.0, 0.0, 0.0
     qty_fill = ex_qty if ex_qty > 0 else qty
     entry_px = avg_px if avg_px > 0 else mark
-    log_trade_open(symbol, order, qty_fill, entry_px, funding_rate, fee_open)
+    try:
+        log_trade_open(symbol, order, qty_fill, entry_px, funding_rate, fee_open)
+    except Exception as e:
+        log_error(
+            f"  [TRADE LOG] OPEN failed for {symbol}: {e} — "
+            "order was sent; verify position on exchange"
+        )
     return order
 
 def close_long(symbol: str, exchange_info: dict, close_reason: str = "manual"):
@@ -1808,7 +2088,38 @@ def check_take_profit(positions: list) -> list:
 
 # --- Diversification helpers --------------------------------------------------
 
-def rank_weighted_sizes(candidates: list, total_budget: float) -> list:
+
+def _max_per_leg_diversification(
+    deploy_cap: float, avail_budget: float, open_slots: int
+) -> float:
+    """
+    Notional cap per *new* leg: min of (a) full-book fair share deploy_cap/MAX_POSITIONS
+    and (b) this cycle's free headroom spread over empty slots, avail/open_slots.
+    (b) bites when the book is partly full — without it, each tranche can still be ~1/7
+    of *total* deploy, which packs 3–4 fat legs.
+    """
+    if deploy_cap <= 0 or open_slots <= 0:
+        return 0.0
+    from_total = float(deploy_cap) / max(1, int(MAX_POSITIONS))
+    from_headroom = float(avail_budget) / max(1, int(open_slots))
+    return min(from_total, from_headroom)
+
+
+def _clip_leg_notionals(candidates: list, max_per_leg: Optional[float]) -> list:
+    """If set, each 'notional' is min(., max_per_leg) so one cycle cannot pack the book into few names."""
+    if not max_per_leg or max_per_leg <= 0:
+        return candidates
+    out: list = []
+    for c in candidates:
+        n = float(c.get("notional", 0) or 0)
+        out.append({**c, "notional": min(n, max_per_leg)})
+    return out
+
+
+def rank_weighted_sizes(
+    candidates: list,
+    total_budget: float,
+) -> list:
     """
     Assign notional size to each candidate using rank-weighted allocation.
 
@@ -1816,7 +2127,8 @@ def rank_weighted_sizes(candidates: list, total_budget: float) -> list:
     Remaining budget is split equally among ranks 2..N.
     Each size is capped at MAX_SINGLE_PCT * total_budget.
 
-    With a single candidate, all deploy budget goes to that symbol (no 25% slice).
+    With a single candidate, notional is min(remaining, MAX_SINGLE_PCT * total_budget) so one
+    passing pool in a cycle cannot consume 100% of headroom and block later MAX_POSITIONS slots.
 
     Returns candidates with a 'notional' key added.
     """
@@ -1827,8 +2139,7 @@ def rank_weighted_sizes(candidates: list, total_budget: float) -> list:
     cap = total_budget * MAX_SINGLE_PCT
 
     if n == 1:
-        # One name: deploy full budget (MAX_SINGLE_PCT only limits when splitting across names).
-        return [{**candidates[0], "notional": total_budget}]
+        return [{**candidates[0], "notional": min(total_budget, cap)}]
 
     top_alloc  = total_budget * RANK_TOP_PCT
     rest_alloc = (total_budget - top_alloc) / (n - 1)
@@ -1837,6 +2148,233 @@ def rank_weighted_sizes(candidates: list, total_budget: float) -> list:
         raw = top_alloc if i == 0 else rest_alloc
         sized.append({**c, "notional": min(raw, cap)})
     return sized
+
+
+def split_budget_by_allocation_mode(
+    candidates: list,
+    total_budget: float,
+    min_funding_floor: float,
+    max_per_leg: Optional[float] = None,
+) -> list:
+    """
+    Assign per-candidate ``notional`` using ALLOCATION_MODE.
+
+    ``rank_weighted`` delegates to ``rank_weighted_sizes``; ``equal`` splits evenly
+    (capped by MAX_SINGLE_PCT); ``funding_linear`` weights by max(0, rate - floor).
+
+    If ``max_per_leg`` is set (min of deploy/MAX_HEADROOM and open-slot share for *new* opens), each
+    notional is clipped so one cycle cannot each take outsized tranches. Omit for full-book targets
+    (e.g. resize with all held names).
+    """
+    if not candidates or total_budget <= 0:
+        return []
+    if ALLOCATION_MODE == "rank_weighted":
+        return _clip_leg_notionals(
+            rank_weighted_sizes(candidates, total_budget), max_per_leg
+        )
+    n = len(candidates)
+    cap = total_budget * MAX_SINGLE_PCT
+    if ALLOCATION_MODE == "equal":
+        if n == 1:
+            r = [{**candidates[0], "notional": min(total_budget, cap)}]
+            return _clip_leg_notionals(r, max_per_leg)
+        per = total_budget / n
+        return _clip_leg_notionals(
+            [{**c, "notional": min(per, cap)} for c in candidates], max_per_leg
+        )
+    weights: list[float] = []
+    for c in candidates:
+        fr = float(c.get("fundingRate", 0) or 0)
+        weights.append(max(0.0, fr - min_funding_floor))
+    s = sum(weights)
+    if s <= 1e-18:
+        return _clip_leg_notionals(
+            rank_weighted_sizes(candidates, total_budget), max_per_leg
+        )
+    if n == 1:
+        r = [{**candidates[0], "notional": min(total_budget, cap)}]
+        return _clip_leg_notionals(r, max_per_leg)
+    out: list = []
+    for c, w in zip(candidates, weights):
+        raw = total_budget * (w / s)
+        out.append({**c, "notional": min(raw, cap)})
+    return _clip_leg_notionals(out, max_per_leg)
+
+
+def compute_effective_max_positions(deploy_cap: float) -> int:
+    """Max concurrent longs this cycle (MAX_POSITIONS_AUTO scales down small budgets)."""
+    if not MAX_POSITIONS_AUTO:
+        return MAX_POSITIONS
+    floor_usd = max(WALLET_MIN_USD, MIN_SLOT_USD)
+    if floor_usd <= 1e-12:
+        floor_usd = WALLET_MIN_USD
+    if deploy_cap <= 0:
+        return 1
+    n_budget = max(1, int(deploy_cap // floor_usd))
+    return max(1, min(MAX_POSITIONS, n_budget))
+
+
+def sync_open_long_state_from_exchange(
+    open_symbols: set,
+    position_sizes: dict,
+    *,
+    log_each: bool = False,
+) -> None:
+    """Rebuild open long sets from the exchange (or dry-run store). Deployed USD = |qty| × mark."""
+    open_symbols.clear()
+    position_sizes.clear()
+    if DRY_RUN:
+        # Live API positions (monitoring / recovered legs) then paper store overlays same symbol.
+        for p in get_positions():
+            amt = float(p.get("positionAmt", 0) or 0)
+            if amt <= 0:
+                continue
+            sym = p["symbol"]
+            open_symbols.add(sym)
+            mp = float(p.get("markPrice", 0) or 0)
+            if mp <= 0:
+                try:
+                    mp = float(get_mark_price(sym))
+                except Exception:
+                    mp = float(p.get("entryPrice", 0) or 0)
+            position_sizes[sym] = abs(amt) * mp
+            if log_each:
+                log_info(
+                    f"  Recovered: {sym}  amt={p['positionAmt']}  "
+                    f"mark_notional≈${position_sizes[sym]:,.0f}"
+                )
+        for sym, p in _dry_positions.items():
+            amt = float(p.get("positionAmt", 0) or 0)
+            if amt <= 0:
+                continue
+            open_symbols.add(sym)
+            mp = float(p.get("markPrice", 0) or 0)
+            if mp <= 0:
+                try:
+                    mp = float(get_mark_price(sym))
+                except Exception:
+                    mp = float(p.get("entryPrice", 0) or 0)
+            position_sizes[sym] = abs(amt) * mp
+            if log_each:
+                log_info(
+                    f"  Recovered: {sym}  amt={p.get('positionAmt', amt)}  "
+                    f"mark_notional≈${position_sizes[sym]:,.0f}  [PAPER]"
+                )
+        return
+    for p in get_positions():
+        amt = float(p.get("positionAmt", 0) or 0)
+        if amt <= 0:
+            continue
+        sym = p["symbol"]
+        open_symbols.add(sym)
+        mp = float(p.get("markPrice", 0) or 0)
+        if mp <= 0:
+            try:
+                mp = float(get_mark_price(sym))
+            except Exception:
+                mp = float(p.get("entryPrice", 0) or 0)
+        position_sizes[sym] = abs(amt) * mp
+        if log_each:
+            log_info(
+                f"  Recovered: {sym}  amt={p['positionAmt']}  "
+                f"mark_notional≈${position_sizes[sym]:,.0f}"
+            )
+
+
+def exchange_has_long_for_symbol(symbol: str) -> bool:
+    """True if the account already has a long > 0 for this symbol (exchange or paper store)."""
+    if DRY_RUN:
+        p = _dry_positions.get(symbol)
+        if p and float(p.get("positionAmt", 0) or 0) > 0:
+            return True
+        try:
+            for row in get_positions():
+                if row.get("symbol") != symbol:
+                    continue
+                if float(row.get("positionAmt", 0) or 0) > 0:
+                    return True
+        except Exception as e:
+            log_warn(f"  exchange_has_long_for_symbol({symbol}): {e}")
+        return False
+    try:
+        for row in get_positions():
+            if row.get("symbol") != symbol:
+                continue
+            if float(row.get("positionAmt", 0) or 0) > 0:
+                return True
+    except Exception as e:
+        log_warn(f"  exchange_has_long_for_symbol({symbol}): {e}")
+    return False
+
+
+def maybe_resize_open_longs(
+    open_symbols: set,
+    position_sizes: dict,
+    deploy_cap: float,
+    rates_ordered: list,
+    rates_by_sym: dict,
+    exchange_info: dict,
+    halted: bool,
+) -> None:
+    """
+    Live only: add notional to existing longs when mark value is below allocation target.
+    Skipped in DRY_RUN (paper store does not merge partial adds) and when DELTA_NEUTRAL.
+    """
+    if DRY_RUN or DELTA_NEUTRAL or not RESIZE_OPEN_LONGS or halted or deploy_cap <= 0:
+        return
+    if not open_symbols:
+        return
+    now_m = time.monotonic()
+    held_rows: list = []
+    seen: set = set()
+    for r in rates_ordered:
+        s = r.get("symbol")
+        if s in open_symbols:
+            held_rows.append(r)
+            seen.add(s)
+    for sym in open_symbols:
+        if sym in seen:
+            continue
+        base = rates_by_sym.get(sym)
+        if base is not None:
+            held_rows.append(base)
+        else:
+            held_rows.append(
+                {"symbol": sym, "fundingRate": 0.0, "nextFundingTime": 0}
+            )
+    targets = split_budget_by_allocation_mode(
+        held_rows, deploy_cap, MIN_FUNDING_RATE
+    )
+    for t in targets:
+        sym = t.get("symbol")
+        if not sym:
+            continue
+        target_n = float(t.get("notional", 0) or 0)
+        live_n = float(position_sizes.get(sym, 0) or 0)
+        if target_n <= live_n + 1e-6:
+            continue
+        delta = target_n - live_n
+        thresh = max(
+            RESIZE_MIN_DELTA_USD,
+            RESIZE_BAND_PCT * target_n if target_n > 0 else 0.0,
+        )
+        if delta < thresh:
+            continue
+        if RESIZE_MIN_INTERVAL_SEC > 0:
+            last = _resize_last_mono.get(sym, 0.0)
+            if now_m - last < RESIZE_MIN_INTERVAL_SEC:
+                continue
+        fr = float(t.get("fundingRate", 0) or 0)
+        try:
+            log_info(
+                f"  [resize] scaling {sym}  +${delta:.0f} notional "
+                f"(live≈${live_n:.0f} → target≈${target_n:.0f})"
+            )
+            open_long(sym, delta, exchange_info, funding_rate=fr)
+            _resize_last_mono[sym] = now_m
+        except Exception as e:
+            log_error(f"  [resize] failed {sym}: {e}")
+
 
 def is_correlated(symbol: str, open_symbols: set) -> bool:
     """
@@ -1903,15 +2441,14 @@ def log_aster_points_margin_advisory(collateral: dict) -> None:
         )
 
 
-def is_pool_symbol_eligible(
+def _pool_symbol_eligible_core(
     r: dict,
     exchange_info: dict,
     volumes_24h: dict,
     volume_filter_active: bool,
 ) -> bool:
     """
-    Min funding + tradable + blacklist; optional SYMBOL_ALLOWLIST + MIN_QUOTE_VOLUME_24H.
-    Does not check open positions or correlation (those apply when actually opening).
+    Pool filters excluding stop-loss cooldown (used to log skip reason on new opens).
     """
     sym = r["symbol"]
     try:
@@ -1933,6 +2470,25 @@ def is_pool_symbol_eligible(
     return True
 
 
+def is_pool_symbol_eligible(
+    r: dict,
+    exchange_info: dict,
+    volumes_24h: dict,
+    volume_filter_active: bool,
+) -> bool:
+    """
+    Min funding + tradable + blacklist; optional SYMBOL_ALLOWLIST + MIN_QUOTE_VOLUME_24H;
+    optional stop-loss cooldown for new opens only.
+    Does not check open positions or correlation (those apply when actually opening).
+    """
+    sym = r["symbol"]
+    if not _pool_symbol_eligible_core(r, exchange_info, volumes_24h, volume_filter_active):
+        return False
+    if STOP_LOSS_AUTO_BLACKLIST and sym in _stop_loss_cooldown_symbols:
+        return False
+    return True
+
+
 def pool_eligibility_rules_label() -> str:
     """Active pool rules for log lines (MIN_FUNDING always; optional allowlist + volume)."""
     parts = ["MIN_FUNDING_RATE"]
@@ -1942,7 +2498,62 @@ def pool_eligibility_rules_label() -> str:
         parts.append("MIN_QUOTE_VOLUME_24H")
     if FUNDING_HISTORY_LOOKBACK_H > 0:
         parts.append("funding_history")
+    if STOP_LOSS_AUTO_BLACKLIST:
+        parts.append("stop_loss_cooldown")
     return " + ".join(parts)
+
+
+def pool_rejection_counts(
+    rates: list,
+    exchange_info: dict,
+    volumes_24h: dict,
+    volume_filter_active: bool,
+) -> Dict[str, int]:
+    """
+    Count coarse rejection reasons for why symbols fail pool eligibility.
+    Intended for one-line diagnostics when no candidates pass filters.
+    """
+    out = {
+        "total": 0,
+        "min_funding": 0,
+        "blacklist_or_not_tradable": 0,
+        "allowlist": 0,
+        "min_quote_volume": 0,
+        "funding_history": 0,
+        "stop_loss_cooldown": 0,
+        "eligible": 0,
+    }
+    for r in rates or []:
+        sym = r.get("symbol")
+        if not sym:
+            continue
+        out["total"] += 1
+        try:
+            fr = float(r.get("fundingRate", 0))
+        except (TypeError, ValueError):
+            fr = 0.0
+        if fr < MIN_FUNDING_RATE:
+            out["min_funding"] += 1
+            continue
+        if sym in BLACKLIST or sym not in exchange_info:
+            out["blacklist_or_not_tradable"] += 1
+            continue
+        if SYMBOL_ALLOWLIST is not None and sym.upper() not in SYMBOL_ALLOWLIST:
+            out["allowlist"] += 1
+            continue
+        if volume_filter_active:
+            qv = float(volumes_24h.get(sym, 0.0) or 0.0)
+            if qv < MIN_QUOTE_VOLUME_24H:
+                out["min_quote_volume"] += 1
+                continue
+        if FUNDING_HISTORY_LOOKBACK_H > 0 and r.get("funding_hist_pool_ok") is False:
+            out["funding_history"] += 1
+            continue
+        if STOP_LOSS_AUTO_BLACKLIST and sym in _stop_loss_cooldown_symbols:
+            out["stop_loss_cooldown"] += 1
+            continue
+        out["eligible"] += 1
+    return out
 
 
 def order_rates_with_symbol_boost(
@@ -2387,6 +2998,19 @@ def log_portfolio_totals_line(
         f"| {Style.DIM}pool dry powder{Style.RESET_ALL} {avail_col}"
         f"${avail_budget:,.0f}{Style.RESET_ALL}{pool_note}{res_s}"
     )
+    if (
+        deploy_cap > 0
+        and n > 0
+        and n < int(MAX_POSITIONS)
+        and at_cap
+    ):
+        fair_leg = deploy_cap / max(1, int(MAX_POSITIONS))
+        log_info(
+            f"  Diversification: {n}/{int(MAX_POSITIONS)} names with no notional headroom (cap is full) — "
+            "the pool cannot add more names until you free notional. "
+            f"≈${fair_leg:,.0f} per name would be the 1/{int(MAX_POSITIONS)} fair share at this deploy. "
+            "Ways: add USDT / increase margin, partially close or trim a leg, or re-open after a rebalance."
+        )
 
     log_section("Holdings")
     if n == 0:
@@ -2475,6 +3099,28 @@ def print_startup_banner(collateral: dict, aster_price: float):
         log_success("=" * 62)
     log_success("  Aster Funding Rate Farmer  --  Multi-Asset Margin Mode")
     log_success("=" * 62)
+    _min_qv = (
+        f"${MIN_QUOTE_VOLUME_24H:,.0f}"
+        if MIN_QUOTE_VOLUME_24H > 0
+        else "off"
+    )
+    _res_pct = f"{RESERVE_DEPLOY_PCT * 100:.1f}%"
+    if os.getenv("RESERVE_DEPLOY_PCT", "").strip() != "":
+        _res_note = "RESERVE_DEPLOY_PCT"
+    elif RESERVE_SLOT_FOR_NEW_POOLS:
+        _res_note = "RESERVE_SLOT_FOR_NEW_POOLS"
+    else:
+        _res_note = "off"
+    _bl_note = f"{len(BLACKLIST)} symbol(s)" if BLACKLIST else "empty"
+    log_success(
+        f"  Resolved env: DRY_RUN={DRY_RUN!s}  "
+        f"DRY_RUN_SIMULATED_MARGIN_USD={DRY_RUN_SIMULATED_MARGIN_USD}  "
+        f"MAX_POSITIONS={MAX_POSITIONS}  MAX_POSITIONS_AUTO={MAX_POSITIONS_AUTO!s}  "
+        f"ALLOCATION_MODE={ALLOCATION_MODE}  RESIZE_OPEN_LONGS={RESIZE_OPEN_LONGS!s}  "
+        f"MIN_QUOTE_VOLUME_24H={_min_qv}  "
+        f"alloc_reserve={_res_pct}({_res_note})  WALLET_DEPLOY_PCT={WALLET_DEPLOY_PCT}  "
+        f"STOP_LOSS_PCT={STOP_LOSS_PCT}  BLACKLIST={_bl_note}"
+    )
 
     if live_wallet_logs_enabled():
         if BALANCE_DUST_USD > 0:
@@ -2599,6 +3245,12 @@ def print_startup_banner(collateral: dict, aster_price: float):
             f"symbols, blend W={FUNDING_RANK_BLEND_WEIGHT}, require={FUNDING_HISTORY_REQUIRE or 'off'}, "
             f"spike_ratio={FUNDING_HISTORY_SPIKE_RATIO or 'off'}"
         )
+    if STOP_LOSS_AUTO_BLACKLIST:
+        _bs = "  CSV_BOOTSTRAP=ON" if STOP_LOSS_BLACKLIST_BOOTSTRAP_FROM_CSV else ""
+        log_success(
+            f"  Stop-loss open cooldown: ON  ≥{STOP_LOSS_BLACKLIST_COUNT} SL closes / "
+            f"{STOP_LOSS_BLACKLIST_WINDOW_H:.0f}h  state={STOP_LOSS_BLACKLIST_STATE_FILE}{_bs}"
+        )
     log_success(f"  MARK_PRICE_WS:  {MARK_PRICE_WS}")
     log_success(f"  SHOW_BOOK_IN_LOGS:  {SHOW_BOOK_IN_LOGS}")
     dn_status = "ENABLED (set DELTA_NEUTRAL=false to disable)" if DELTA_NEUTRAL else "disabled (set DELTA_NEUTRAL=true to enable HL hedge)"
@@ -2640,23 +3292,9 @@ def run(max_cycles: int = 0) -> None:
 
     exchange_info  = get_exchange_info()
     open_symbols:   set  = set()   # currently open symbols
-    position_sizes: dict = {}        # symbol -> notional deployed
+    position_sizes: dict = {}        # symbol -> mark notional (synced each cycle)
 
-    for p in get_positions():
-        if float(p["positionAmt"]) > 0:
-            sym = p["symbol"]
-            open_symbols.add(sym)
-            amt = abs(float(p["positionAmt"]))
-            ep = float(p.get("entryPrice", 0) or 0)
-            mp = float(p.get("markPrice", 0) or 0)
-            if ep > 0:
-                position_sizes[sym] = amt * ep
-            elif mp > 0:
-                position_sizes[sym] = amt * mp
-            log_info(
-                f"  Recovered: {sym}  amt={p['positionAmt']}  "
-                f"init_stake≈${position_sizes.get(sym, 0):,.0f}"
-            )
+    sync_open_long_state_from_exchange(open_symbols, position_sizes, log_each=True)
 
     log_startup_funding_countdowns(open_symbols)
 
@@ -2669,7 +3307,11 @@ def run(max_cycles: int = 0) -> None:
                 ws_base = os.getenv(
                     "FSTREAM_WS_URL", "wss://fstream.asterdex.com/stream"
                 ).strip()
-                mark_watcher = MarkPriceWatcher(STOP_LOSS_PCT, base_url=ws_base)
+                mark_watcher = MarkPriceWatcher(
+                    STOP_LOSS_PCT,
+                    take_profit_pct=TAKE_PROFIT_PCT,
+                    base_url=ws_base,
+                )
                 mark_watcher.start()
                 log_success(
                     "  [WS] Mark price combined stream — faster stop vs entry (REST still runs)"
@@ -2680,12 +3322,23 @@ def run(max_cycles: int = 0) -> None:
             log_warn(f"  [WS] Mark price stream not started: {e}")
             mark_watcher = None
 
+    if STOP_LOSS_AUTO_BLACKLIST:
+        maybe_bootstrap_stop_loss_blacklist_from_csv()
+        refresh_stop_loss_blacklist_cache()
+
     try:
         from code_review_scheduler import start_code_review_daemon_if_enabled
 
         start_code_review_daemon_if_enabled()
     except Exception as e:
         log_warn(f"  [code_review] Could not start daemon: {e}")
+
+    try:
+        from advisor_report_scheduler import start_advisor_report_daemon_if_enabled
+
+        start_advisor_report_daemon_if_enabled()
+    except Exception as e:
+        log_warn(f"  [advisor_report] Could not start daemon: {e}")
 
     news_symbol_expiry: dict[str, float] = {}
     last_x_news_poll_monotonic = 0.0
@@ -2702,6 +3355,73 @@ def run(max_cycles: int = 0) -> None:
                 f"\n{Style.DIM}{Fore.LIGHTBLACK_EX}  === cycle {main_loop_i} · {_cycle_ts} ==="
                 f"{Style.RESET_ALL}"
             )
+            sync_open_long_state_from_exchange(open_symbols, position_sizes, log_each=False)
+
+            # --- Risk hot path (run early, before slow API work) -------------------------
+            # Mark-price WebSocket (push) — drain before REST stop-loss/take-profit
+            if mark_watcher is not None:
+                mark_watcher.sync(stop_loss_entries())
+                for sym in mark_watcher.drain_stop_signals():
+                    log_warn(f"  [WS] Stop loss triggered (mark): {sym}")
+                    close_long(sym, exchange_info, close_reason="stop_loss_ws")
+                    if DELTA_NEUTRAL and hl_info:
+                        hl_close_short(
+                            hl_info,
+                            hl_exchange,
+                            hl_address,
+                            sym.replace("USDT", ""),
+                            "stop_loss_ws",
+                        )
+                    open_symbols.discard(sym)
+                    position_sizes.pop(sym, None)
+
+                # Optional: take-profit signals from mark stream (if watcher supports it)
+                drain_tp = getattr(mark_watcher, "drain_take_profit_signals", None)
+                if callable(drain_tp):
+                    for sym in drain_tp():
+                        log_warn(f"  [WS] Take profit triggered (mark): {sym}")
+                        close_long(sym, exchange_info, close_reason="take_profit")
+                        if DELTA_NEUTRAL and hl_info:
+                            hl_close_short(
+                                hl_info,
+                                hl_exchange,
+                                hl_address,
+                                sym.replace("USDT", ""),
+                                "take_profit",
+                            )
+                        open_symbols.discard(sym)
+                        position_sizes.pop(sym, None)
+
+            positions = get_positions()
+
+            # Stop loss (REST / poll)
+            for sym in check_stop_loss(positions):
+                close_long(sym, exchange_info, close_reason="stop_loss")
+                if DELTA_NEUTRAL and hl_info:
+                    hl_close_short(
+                        hl_info,
+                        hl_exchange,
+                        hl_address,
+                        sym.replace("USDT", ""),
+                        "stop_loss",
+                    )
+                open_symbols.discard(sym)
+                position_sizes.pop(sym, None)
+
+            # Take profit (REST / poll)
+            for sym in check_take_profit(positions):
+                close_long(sym, exchange_info, close_reason="take_profit")
+                if DELTA_NEUTRAL and hl_info:
+                    hl_close_short(
+                        hl_info,
+                        hl_exchange,
+                        hl_address,
+                        sym.replace("USDT", ""),
+                        "take_profit",
+                    )
+                open_symbols.discard(sym)
+                position_sizes.pop(sym, None)
+
             log_info("  Scanning funding rates...")
             rates = get_all_funding_rates()
             rates = enrich_rates_with_funding_history(rates)
@@ -2765,44 +3485,15 @@ def run(max_cycles: int = 0) -> None:
             aster_price   = get_aster_price()
             total_budget  = compute_deploy_budget(collateral)
             deploy_cap    = effective_deploy_cap(total_budget)
-            avail_budget  = available_budget(deploy_cap, position_sizes)
             margin_total  = collateral.get("_total_effective_margin", 0)
+            if collateral.get("_margin_capped_by_account") is True:
+                cap = collateral.get("_account_available_balance_usdt")
+                if isinstance(cap, (int, float)) and float(cap) > 0:
+                    log_warn(f"  [MARGIN_CAPPED] sizing uses availableBalance cap ≈ ${float(cap):,.0f}")
 
             halted, halt_reason = farming_halt_active()
 
-            # Mark-price WebSocket (push) — drain before REST stop-loss
-            if mark_watcher is not None:
-                mark_watcher.sync(stop_loss_entries())
-                for sym in mark_watcher.drain_stop_signals():
-                    log_warn(f"  [WS] Stop loss triggered (mark): {sym}")
-                    close_long(sym, exchange_info, close_reason="stop_loss_ws")
-                    if DELTA_NEUTRAL and hl_info:
-                        hl_close_short(
-                            hl_info,
-                            hl_exchange,
-                            hl_address,
-                            sym.replace("USDT", ""),
-                            "stop_loss_ws",
-                        )
-                    open_symbols.discard(sym)
-                    position_sizes.pop(sym, None)
-
-            # Stop loss (REST / poll)
-            for sym in check_stop_loss(get_positions()):
-                close_long(sym, exchange_info, close_reason="stop_loss")
-                if DELTA_NEUTRAL and hl_info:
-                    hl_close_short(hl_info, hl_exchange, hl_address,
-                                   sym.replace("USDT",""), "stop_loss")
-                open_symbols.discard(sym)
-                position_sizes.pop(sym, None)
-
-            for sym in check_take_profit(get_positions()):
-                close_long(sym, exchange_info, close_reason="take_profit")
-                if DELTA_NEUTRAL and hl_info:
-                    hl_close_short(hl_info, hl_exchange, hl_address,
-                                   sym.replace("USDT",""), "take_profit")
-                open_symbols.discard(sym)
-                position_sizes.pop(sym, None)
+            refresh_stop_loss_blacklist_cache()
 
             # Exit on funding flip
             for sym in list(open_symbols):
@@ -2845,14 +3536,23 @@ def run(max_cycles: int = 0) -> None:
                     open_symbols.discard(sym)
                     position_sizes.pop(sym, None)
 
-            # Open new positions (rank-weighted diversification)
-            slots = MAX_POSITIONS - len(open_symbols)
+            sync_open_long_state_from_exchange(open_symbols, position_sizes, log_each=False)
+            avail_budget = available_budget(deploy_cap, position_sizes)
+            effective_max = compute_effective_max_positions(deploy_cap)
+            slots = effective_max - len(open_symbols)
+            rates_by_sym = {r["symbol"]: r for r in rates}
+
+            # Open new positions (diversified sizing — see ALLOCATION_MODE)
             if slots > 0 and halted:
                 log_warn(
                     f"  [FARMING_HALT] {halt_reason} — skipping new opens; "
                     "stop-loss / take-profit / funding exits still run."
                 )
             elif slots > 0:
+                # Per-leg cap: min(fair 1/MAX of total book, 1/slots of remaining headroom)
+                _mpleg = _max_per_leg_diversification(
+                    deploy_cap, avail_budget, int(slots)
+                )
                 # Build candidate list incrementally so correlation guard
                 # sees symbols selected earlier in the same cycle
                 pending: set = set()
@@ -2861,16 +3561,34 @@ def run(max_cycles: int = 0) -> None:
                     if len(raw_candidates) >= slots:
                         break
                     sym = r["symbol"]
-                    if not is_pool_symbol_eligible(
+                    if not _pool_symbol_eligible_core(
                         r, exchange_info, volumes_24h, volume_filter_active
                     ):
                         continue
+                    if STOP_LOSS_AUTO_BLACKLIST and sym in _stop_loss_cooldown_symbols:
+                        log_warn(
+                            f"  {sym} skip new open: stop-loss cooldown "
+                            f"(≥{STOP_LOSS_BLACKLIST_COUNT} in {STOP_LOSS_BLACKLIST_WINDOW_H:.0f}h) "
+                            f"— {STOP_LOSS_BLACKLIST_STATE_FILE}"
+                        )
+                        continue
+                    if STOP_LOSS_REENTRY_COOLDOWN_SEC > 0:
+                        now_m = time.monotonic()
+                        last = float(_stop_loss_close_last_mono.get(sym, 0.0) or 0.0)
+                        if last > 0 and (now_m - last) < float(STOP_LOSS_REENTRY_COOLDOWN_SEC):
+                            wait_s = float(STOP_LOSS_REENTRY_COOLDOWN_SEC) - (now_m - last)
+                            log_warn(
+                                f"  {sym} skip new open: stop-loss re-entry cooldown "
+                                f"({(now_m - last):.1f}s ago <{STOP_LOSS_REENTRY_COOLDOWN_SEC:.0f}s) "
+                                f"— wait ~{max(0.0, wait_s):.0f}s"
+                            )
+                            continue
                     if sym in open_symbols or is_correlated(sym, open_symbols | pending):
                         continue
                     raw_candidates.append(r)
                     pending.add(sym)
 
-                # Rank-weighted sizing from live wallet budget
+                # Split avail_budget across candidates (see ALLOCATION_MODE)
                 if avail_budget < WALLET_MIN_USD:
                     _deployed_sum = sum(position_sizes.values())
                     _cap_eps = max(50.0, 0.01 * deploy_cap) if deploy_cap > 0 else 0.0
@@ -2886,7 +3604,30 @@ def run(max_cycles: int = 0) -> None:
                         )
                     raw_candidates = []  # prevent opening below min
 
-                candidates = rank_weighted_sizes(raw_candidates, avail_budget)
+                candidates = split_budget_by_allocation_mode(
+                    raw_candidates,
+                    avail_budget,
+                    MIN_FUNDING_RATE,
+                    max_per_leg=_mpleg if _mpleg > 0 else None,
+                )
+                if raw_candidates or candidates:
+                    _fb = float(deploy_cap) / max(1, int(MAX_POSITIONS)) if deploy_cap > 0 else 0.0
+                    _hs = (
+                        float(avail_budget) / max(1, int(slots)) if int(slots) > 0 else 0.0
+                    )
+                    _sumN = sum(float(c.get("notional", 0) or 0) for c in (candidates or ()))
+                    log_info(
+                        f"  [sizing] {ALLOCATION_MODE}  raw_pools={len(raw_candidates)}  "
+                        f"after_split={len(candidates)}  empty_slots={int(slots)}  "
+                        f"deploy_cap=${deploy_cap:,.0f}  avail=${avail_budget:,.0f}  "
+                        f"fair_leg(÷{int(MAX_POSITIONS)})=${_fb:,.0f}  headroom/empty_slot=${_hs:,.0f}  "
+                        f"per_leg_cap min(fair,headroom)=${_mpleg:,.0f}  sum(notional)≈${_sumN:,.0f}"
+                    )
+                    for _j, c in enumerate(candidates or ()):
+                        _n = float(c.get("notional", 0) or 0)
+                        log_info(
+                            f"  [sizing]   leg {_j+1}  {c.get('symbol', '?')}  notional≈${_n:,.0f}"
+                        )
 
                 # Small wallet: split sizes are all under WALLET_MIN_USD — one concentrated leg.
                 if (
@@ -2895,16 +3636,40 @@ def run(max_cycles: int = 0) -> None:
                     and all(c.get("notional", 0) < WALLET_MIN_USD for c in candidates)
                 ):
                     top = candidates[0]
+                    _fair_ceil = (
+                        float(deploy_cap) / max(1, int(MAX_POSITIONS))
+                        if deploy_cap > 0
+                        else 0.0
+                    )
+                    if _mpleg and _mpleg > 0:
+                        # Still try to meet exchange min; do not use full avail if one leg fits
+                        one_leg = min(
+                            avail_budget,
+                            max(_mpleg, WALLET_MIN_USD),
+                            _fair_ceil or float("inf"),
+                        )
+                    else:
+                        one_leg = (
+                            min(avail_budget, _fair_ceil) if _fair_ceil > 0 else avail_budget
+                        )
                     log_warn(
                         f"  Split sizes each < WALLET_MIN_USD (${WALLET_MIN_USD:.0f}) — "
-                        f"concentrating full ${avail_budget:.0f} deploy on {top['symbol']}"
+                        f"concentrating ${one_leg:.0f} deploy on {top['symbol']}"
                     )
-                    candidates = [{**top, "notional": avail_budget}]
+                    candidates = [{**top, "notional": one_leg}]
 
                 for c in candidates:
                     sym      = c["symbol"]
                     rate     = c["fundingRate"]
-                    notional = c["notional"]
+                    notional = float(c.get("notional", 0) or 0)
+                    if deploy_cap > 0:
+                        _fmax_leg = float(deploy_cap) / max(1, int(MAX_POSITIONS))
+                        if notional > _fmax_leg + 0.5:
+                            log_info(
+                                f"  {sym} capping notional ${notional:,.0f} → ${_fmax_leg:,.0f} "
+                                f"(hard cap: deploy_cap/MAX_POSITIONS = fair book share)"
+                            )
+                            notional = _fmax_leg
                     if notional < WALLET_MIN_USD:
                         log_warn(f"  {sym} notional ${notional:.0f} below min "
                                  f"${WALLET_MIN_USD:.0f} -- skipping")
@@ -2942,6 +3707,24 @@ def run(max_cycles: int = 0) -> None:
                         f"({apr:.1f}% APR)  ${notional:.0f} notional  "
                         f"next funding {mins}m"
                     )
+                    if exchange_has_long_for_symbol(sym):
+                        log_warn(
+                            f"  Skip new open {sym}: exchange already shows a long "
+                            "(synced state — avoid duplicate leg)"
+                        )
+                        continue
+                    if OPEN_ATTEMPT_COOLDOWN_SEC > 0:
+                        now_m = time.monotonic()
+                        last = float(_open_attempt_last_mono.get(sym, 0.0) or 0.0)
+                        if last > 0 and (now_m - last) < float(OPEN_ATTEMPT_COOLDOWN_SEC):
+                            wait_s = float(OPEN_ATTEMPT_COOLDOWN_SEC) - (now_m - last)
+                            log_warn(
+                                f"  Skip new open {sym}: recent open attempt "
+                                f"{(now_m - last):.1f}s ago (<{OPEN_ATTEMPT_COOLDOWN_SEC:.0f}s) "
+                                f"— wait ~{max(0.0, wait_s):.0f}s"
+                            )
+                            continue
+                        _open_attempt_last_mono[sym] = now_m
                     try:
                         set_cross_margin(sym)
                         set_leverage(sym, LEVERAGE)
@@ -2954,8 +3737,6 @@ def run(max_cycles: int = 0) -> None:
                                 log_warn(f"  HL short failed for {sym} -- skipping")
                                 continue
                         open_long(sym, notional, exchange_info, funding_rate=rate)
-                        open_symbols.add(sym)
-                        position_sizes[sym] = notional
                     except Exception as e:
                         log_error(f"  Failed to open {sym}: {e}")
 
@@ -2999,9 +3780,22 @@ def run(max_cycles: int = 0) -> None:
                                     and not is_correlated(r["symbol"], open_symbols)
                                 ]
                                 if not eligible:
+                                    rc = pool_rejection_counts(
+                                        rates_ordered,
+                                        exchange_info,
+                                        volumes_24h,
+                                        volume_filter_active,
+                                    )
                                     log_warn(
                                         "  No qualifying opportunities — no symbol passes "
-                                        f"{pool_eligibility_rules_label()} together."
+                                        f"{pool_eligibility_rules_label()} together. "
+                                        f"(eligible=0/{rc['total']}  "
+                                        f"min_funding={rc['min_funding']}  "
+                                        f"blacklist_or_not_tradable={rc['blacklist_or_not_tradable']}  "
+                                        f"allowlist={rc['allowlist']}  "
+                                        f"min_quote_volume={rc['min_quote_volume']}  "
+                                        f"funding_history={rc['funding_history']}  "
+                                        f"stop_loss_cooldown={rc['stop_loss_cooldown']})"
                                     )
                                 elif not not_held:
                                     extra = (
@@ -3042,12 +3836,26 @@ def run(max_cycles: int = 0) -> None:
                                 else:
                                     log_warn(
                                         "  No qualifying opportunities — top rates filtered "
-                                        "(BLACKLIST, not tradable in exchangeInfo, or correlation)"
+                                        "(BLACKLIST, SL cooldown, not tradable in exchangeInfo, or correlation)"
                                     )
                     else:
                         log_info("  No qualifying opportunities this cycle")
             else:
-                log_info(f"  At max positions ({MAX_POSITIONS}) -- holding")
+                log_info(f"  At max positions ({effective_max}) -- holding")
+
+            sync_open_long_state_from_exchange(open_symbols, position_sizes, log_each=False)
+            avail_budget = available_budget(deploy_cap, position_sizes)
+            maybe_resize_open_longs(
+                open_symbols,
+                position_sizes,
+                deploy_cap,
+                rates_ordered,
+                rates_by_sym,
+                exchange_info,
+                halted,
+            )
+            sync_open_long_state_from_exchange(open_symbols, position_sizes, log_each=False)
+            avail_budget = available_budget(deploy_cap, position_sizes)
 
             stake_map: dict = {}
             exchange_symbols: set = set()

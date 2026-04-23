@@ -46,9 +46,11 @@ class MarkPriceWatcher:
     def __init__(
         self,
         stop_loss_pct: float,
+        take_profit_pct: float = 0.0,
         base_url: str = DEFAULT_WS_BASE,
     ) -> None:
         self.stop_loss_pct = float(stop_loss_pct)
+        self.take_profit_pct = max(0.0, float(take_profit_pct))
         self.base_url = base_url.rstrip("/") or DEFAULT_WS_BASE
         self._entries: Dict[str, float] = {}
         self._entry_lock = threading.Lock()
@@ -56,6 +58,7 @@ class MarkPriceWatcher:
         self._last_url: Optional[str] = None
         self._url_lock = threading.Lock()
         self._stop_queue: "queue.Queue[str]" = queue.Queue()
+        self._tp_queue: "queue.Queue[str]" = queue.Queue()
         self._ws = None
         self._ws_ref_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
@@ -128,6 +131,21 @@ class MarkPriceWatcher:
                 deduped.append(s)
         return deduped
 
+    def drain_take_profit_signals(self) -> list[str]:
+        out: list[str] = []
+        while True:
+            try:
+                out.append(self._tp_queue.get_nowait())
+            except queue.Empty:
+                break
+        seen: Set[str] = set()
+        deduped: list[str] = []
+        for s in out:
+            if s not in seen:
+                seen.add(s)
+                deduped.append(s)
+        return deduped
+
     def _handle_message(self, message: str) -> None:
         try:
             msg = json.loads(message)
@@ -177,6 +195,15 @@ class MarkPriceWatcher:
             self._stop_queue.put(sym)
             log.warning(
                 "Mark WS stop signal %s  mark=%.6f  entry=%.6f  pnl=%.2f%%",
+                sym,
+                mark,
+                entry,
+                pnl_pct * 100,
+            )
+        elif self.take_profit_pct > 0 and pnl_pct >= self.take_profit_pct:
+            self._tp_queue.put(sym)
+            log.warning(
+                "Mark WS take-profit signal %s  mark=%.6f  entry=%.6f  pnl=%.2f%%",
                 sym,
                 mark,
                 entry,

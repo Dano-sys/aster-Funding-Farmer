@@ -8,6 +8,7 @@
 #   fly secrets set CLAUDE_ADVISOR_LOOP_ON_FLY=true CLAUDE_ADVISOR_ENABLED=true ANTHROPIC_API_KEY=...
 # To turn off again: fly secrets unset CLAUDE_ADVISOR_LOOP_ON_FLY -a <app>
 # Logs: fly logs
+# MAX_POSITIONS and WALLET_DEPLOY_PCT are set as fly secrets in prod — update via `fly secrets set` to match [env] here; secrets override [env].
 
 app = "aster-funding-farmer"
 # Egress IP / geo: was iad (US). If Aster returns -5019 on orders, try EU (fra) or Asia (sin, nrt).
@@ -23,11 +24,41 @@ primary_region = "fra"
   initial_size = "1gb"
 
 [env]
+  # Real orders. Do not set DRY_RUN as a secret unless you want paper; secrets override this.
+  DRY_RUN = "false"
+  DRY_RUN_SIMULATED_MARGIN_USD = "0"
   TRADE_LOG_FILE = "/data/trades.csv"
   FUNDING_FARMER_LOG = "/data/funding_farmer.log"
   ALERT_WATCHER_STATE_FILE = "/data/.alert_watcher_state.json"
   # docker-entrypoint: do not start claude_advisor loop until you opt in (secrets override this key if set).
   CLAUDE_ADVISOR_LOOP_ON_FLY = "false"
+  # Pool quality + sizing (non-secret); override via fly secrets if you need different values.
+  MIN_QUOTE_VOLUME_24H = "1000000"
+  BLACKLIST = "UBUSDT,XPINUSDT,ASTEROIDUSDT,DAMUSDT,PLAYUSDT,RAVEUSDT"
+  WALLET_DEPLOY_PCT = "0.60"
+  # 0 = no hard cap on total deploy notional (use margin × WALLET_DEPLOY_PCT × LEVERAGE only).
+  # A small number (e.g. 150) is for staged tests; with larger live books it blocks new opens while slots stay free.
+  WALLET_MAX_USD = "0"
+  MAX_POSITIONS = "5"
+  POLL_INTERVAL_SEC = "30"
+  RISK_POLL_INTERVAL_SEC = "5"
+  MIN_FUNDING_RATE = "0.00005"
+  EXIT_FUNDING_RATE = "0.00005"
+  STOP_LOSS_PCT = "0.05"
+  TAKE_PROFIT_PCT = "0.20"
+  # After N stop-loss closes per symbol within WINDOW_H, skip new opens (state on volume).
+  STOP_LOSS_AUTO_BLACKLIST = "true"
+  STOP_LOSS_BLACKLIST_COUNT = "3"
+  STOP_LOSS_BLACKLIST_WINDOW_H = "168"
+  STOP_LOSS_BLACKLIST_STATE_FILE = "/data/.stop_loss_blacklist_state.json"
+  RESERVE_SLOT_FOR_NEW_POOLS = "false"
+  # Pipe = same "economic" name in one group; comma = separate groups. Prevents e.g. SOLUSDT+SOLUSD1 at once.
+  # Match secrets on Fly: secrets override. Default in funding_farmer.py if unset.
+  CORR_GROUPS = "BTCUSDT|WBTCUSDT,ETHUSDT|STETHUSDT|WETHUSDT,SOLUSDT|SOLUSD1"
+  # Exchange-sync / sizing extras (override via secrets if needed)
+  MAX_POSITIONS_AUTO = "false"
+  ALLOCATION_MODE = "equal"
+  RESIZE_OPEN_LONGS = "false"
 
 [[vm]]
   memory = "512mb"

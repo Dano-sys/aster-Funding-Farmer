@@ -1,6 +1,8 @@
 .git
 .env
 .env.*
+# Local override file (config loads after .env); must not ship in image or it overrides Fly [env] / secrets.
+env
 __pycache__
 *.pyc
 *.pyo
